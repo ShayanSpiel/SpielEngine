@@ -8,6 +8,7 @@
     "decide_stall",
     "memory_context_hygiene",
     "learning_loop",
+    "direct_memory_causal",
     "acceptance_green"
   ]
 }

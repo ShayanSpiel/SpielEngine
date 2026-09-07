@@ -117,13 +117,19 @@ Memory retrieval is topology-aware: `relevant(goal_id=B)` returns B's own
 strategy claims plus the active strategy claims of Goals B is
 structurally related to — siblings (same owner and metric), its parent,
 its children, and both directions of a `supports` edge — never the
-claims of unrelated Goals. Owner and workflow scoping are unchanged.
+claims of unrelated Goals. Direct-work lessons are goal-keyed: a
+workflow-scope claim with no workflow_id (written by `tasks <id>
+--complete --learning` on a direct order) reaches future direct orders
+of that same Goal exactly. Owner and workflow scoping are otherwise
+unchanged.
 
 Memory is causal, not decorative: every WorkOrder brief carries a
 bounded `memory` list — the workflow's own recorded learning for
 workflow orders, the goal-relevant claims (never owner profile claims)
-for direct ones — so the executor's next execution builds on what the
-last one learned. Parked asks render the same learning as
+for direct ones, including the goal's own direct-work lessons
+(workflow_id NULL, written by `tasks --complete --learning`), so the
+executor's next execution builds on what the last one learned. Parked
+asks render the same learning as
 `Workflow learning: <claims>` / `Relevant memory: <claims>` lines; with
 no claims recorded the brief key and the line stay empty.
 

@@ -99,7 +99,10 @@ strategy claims of Goals it is structurally related to (same owner and
 metric, parent, child, or supports edge), parked asks append the workflow
 or goal-relevant learning they should build on, and every WorkOrder brief
 carries that bounded `memory` list so the next execution differs from the
-last — memory is causal, not decorative. Strategy memory stays selective —
+last — memory is causal, not decorative. Direct-work lessons are
+goal-keyed: a lesson learned completing a direct order (workflow_id NULL)
+reaches future direct orders of that same Goal. Strategy memory stays
+selective —
 completing a goal writes no new strategy claims; owners and evidence-backed
 host distillation are the only strategy writers, operational lessons are
 the only per-completion writes, and stale claims retire with

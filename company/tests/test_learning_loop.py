@@ -7,7 +7,12 @@ Pins for the learning-architecture system-improvement Goal:
   same workflow carries those claims inside its brief (bounded, newest
   ~5) — a double-executor probe proves Run 2 behaves differently with
   the learning present and identically to Run 1 without it. Direct
-  WorkOrder briefs carry the goal's relevant non-owner claims.
+  WorkOrder briefs carry the goal's relevant non-owner claims, which
+  since the direct-memory fix include the goal's own direct-work
+  lessons (workflow-scope, ``workflow_id`` NULL): completing a direct
+  order with ``--learning`` makes the SAME goal's next direct order
+  causally carry that lesson, while another workflow's claims and
+  another goal's lessons never reach it.
 - L1 (B) relevance topology: active strategy claims reach the same
   Goal, siblings (same owner+metric), parent, child, and
   supports-related Goals through explicit SQL joins; an unrelated Goal
@@ -277,7 +282,9 @@ class TestCausalWorkflowLearning(LearningLoopCase):
 
 
 class TestDirectBriefMemory(LearningLoopCase):
-    """L1: direct WorkOrder briefs carry goal-relevant non-owner claims."""
+    """L1: direct WorkOrder briefs carry the goal's relevant non-owner
+    claims — its own direct-work lessons (workflow_id NULL) included,
+    other workflows' claims and other goals' lessons excluded."""
 
     def test_direct_brief_carries_goal_relevant_claims_not_owner_claims(self):
         # Strategy learning recorded on the goal reaches the direct
@@ -310,8 +317,13 @@ class TestDirectBriefMemory(LearningLoopCase):
                          "empty bounded list")
 
     def test_workflow_claims_do_not_reach_a_direct_brief_by_goal(self):
-        # Workflow-scoped claims apply only with their workflow_id: a
-        # direct order for the goal does not inherit them.
+        # Contract updated for the direct-memory fix (live-tested
+        # defect): a workflow-scope claim with a REAL workflow_id still
+        # applies only with that workflow_id — a direct order for the
+        # goal does not inherit another workflow's claims, and a
+        # workflow_id-NULL lesson of a DIFFERENT goal never reaches this
+        # goal's query either. The goal's own workflow_id-NULL lessons
+        # DO reach its direct briefs — pinned separately below.
         self.new_goal()
         run = self.current_run()
         evidence = self.runtime.evidence.record(
@@ -320,10 +332,90 @@ class TestDirectBriefMemory(LearningLoopCase):
             "workflow", "warm intros convert better",
             evidence_ids=(evidence.id,), goal_id=self.goal_id,
             run_id=run.id, workflow_id="outbound:email-outreach")
+        other = self.runtime.create_goal(
+            name="Other", owner_id="director", metric="m_other",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        other_run = self.runtime.runs.current(other["id"])
+        other_evidence = self.runtime.evidence.record(
+            goal_id=other["id"], run_id=other_run.id, kind="m_other",
+            payload={"m_other": 0})
+        self.runtime.memory.remember(
+            "workflow", "another goal's direct lesson",
+            evidence_ids=(other_evidence.id,), goal_id=other["id"],
+            run_id=other_run.id)
         order = self.park_bounded_direct_work(instruction="close one deal")
+        self.assertEqual(order["step_id"], "direct")
         self.assertEqual(order["brief"]["memory"], [],
-                         "workflow claims reach only their own workflow's "
-                         "briefs, not direct orders")
+                         "workflow claims with a real workflow_id reach "
+                         "only that workflow's briefs, and a different "
+                         "goal's workflow_id-NULL lessons never reach "
+                         "this goal's direct orders")
+
+    def test_a_direct_brief_carries_the_goals_own_direct_work_lessons(self):
+        # The new contract's positive half (the fix for the orphaned
+        # direct-work learning, live-tested on the probe goal): a
+        # workflow-scope claim with workflow_id NULL recorded on THIS
+        # goal is the goal's own operational learning and reaches this
+        # goal's direct briefs exactly.
+        self.new_goal()
+        run = self.current_run()
+        evidence = self.runtime.evidence.record(
+            goal_id=self.goal_id, run_id=run.id, kind="m", payload={"m": 0})
+        self.runtime.memory.remember(
+            "workflow", "validate the domain before enriching",
+            evidence_ids=(evidence.id,), goal_id=self.goal_id,
+            run_id=run.id)
+        order = self.park_bounded_direct_work(instruction="close one deal")
+        self.assertEqual(order["step_id"], "direct")
+        self.assertIn("validate the domain before enriching",
+                      order["brief"]["memory"],
+                      "the goal's own direct-work lessons "
+                      "(workflow_id NULL) reach its direct briefs")
+
+    def test_direct_learning_is_causal_for_the_next_direct_order(self):
+        # The direct->direct causal pin (acceptance B): complete one
+        # direct order with --learning through the real write path,
+        # drive the SAME goal to its next direct order, and assert the
+        # new order's brief memory carries the lesson — while a
+        # DIFFERENT goal's direct brief does not. This is the seam that
+        # was orphaned before the fix: the claim was stored with full
+        # lineage but no goal query could ever retrieve it.
+        self.new_goal(name="Causal direct", metric="m", target=999)
+        order = self.park_bounded_direct_work(
+            instruction="produce the metric evidence")
+        self.runtime.complete_work_order(
+            order["id"], "director",
+            [{"kind": "m", "payload": {"m": 1}}],
+            learning="run one lesson: validate before enriching")
+        claims = [item.claim for item in self.runtime.memory.relevant(
+            goal_id=self.goal_id)]
+        self.assertIn("run one lesson: validate before enriching", claims,
+                      "the direct completion's lesson is retrievable by "
+                      "goal query immediately after the write")
+        # Drive the SAME goal to its next direct order.
+        next_order = self.park_bounded_direct_work(
+            instruction="produce the metric evidence again")
+        self.assertEqual(next_order["step_id"], "direct")
+        self.assertNotEqual(next_order["id"], order["id"])
+        self.assertIn("run one lesson: validate before enriching",
+                      next_order["brief"]["memory"],
+                      "the SAME goal's next direct order carries the "
+                      "lesson its previous direct order learned — "
+                      "direct-work learning is causal")
+        # A DIFFERENT goal's direct brief does not carry it.
+        other = self.runtime.create_goal(
+            name="Other goal", owner_id="director", metric="m_other",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        saved = self.goal_id
+        self.goal_id = other["id"]
+        foreign_order = self.park_bounded_direct_work(
+            instruction="unrelated work")
+        self.goal_id = saved
+        self.assertEqual(foreign_order["step_id"], "direct")
+        self.assertNotIn("run one lesson: validate before enriching",
+                         foreign_order["brief"]["memory"],
+                         "a different goal's direct brief carries none "
+                         "of this goal's direct-work lessons")
 
 
 # =========================================================================

@@ -117,8 +117,12 @@ class MemoryRepository:
         Goal's evidenced learning informs the Goals it shares structure
         with, while unrelated Goals (no edge, different owner and
         metric, no parent link) receive nothing. Workflow claims apply
-        only with their workflow_id. Explicit SQL joins only — no
-        embeddings, no clustering.
+        only with their workflow_id — with one exception: direct-work
+        lessons (workflow-scope claims with ``workflow_id`` NULL) are
+        the Goal's own operational learning, so a goal query returns
+        them for that Goal exactly (``goal_id`` matches the queried
+        Goal; they never reach another Goal's query). Explicit SQL
+        joins only — no embeddings, no clustering.
         """
         if limit < 1:
             return []
@@ -149,6 +153,17 @@ class MemoryRepository:
                 OR goal_id IN (SELECT target_goal_id FROM core_goal_edges
                                WHERE source_goal_id=? AND relation='supports')))""")
             values.extend([goal_id] * 7)
+            # Direct-work lessons are goal-keyed: a workflow-scope claim
+            # with workflow_id NULL was learned doing this Goal's own
+            # bounded direct work (``tasks --complete --learning``), so
+            # the goal query returns it for this Goal exactly. A
+            # workflow claim with a real workflow_id still applies only
+            # with that workflow_id, and a workflow_id-NULL claim of a
+            # different Goal never reaches this query (exact goal_id
+            # match — no scope bleed).
+            applicable.append("(scope='workflow' AND workflow_id IS NULL"
+                              " AND goal_id=?)")
+            values.append(goal_id)
         if workflow_id:
             applicable.append("(scope='workflow' AND workflow_id=?)")
             values.append(workflow_id)

@@ -21,7 +21,9 @@ runs chain automatically: there are no per-run owner gates.
 
 Memory is causal and classified: WorkOrder briefs carry the bounded active
 learning for the work they open (workflow-scope claims for workflow orders,
-goal-relevant claims for direct ones), so the next execution builds on the
+goal-relevant claims for direct ones — including the goal's own direct-work
+lessons, which are goal-keyed and reach future direct orders of the same
+Goal), so the next execution builds on the
 last one's evidence-backed lesson. Owner preferences write owner scope
 (`profile set`), operational lessons write workflow scope
 (`tasks --complete --learning`, only when something reusable was learned),
