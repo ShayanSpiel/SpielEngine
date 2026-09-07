@@ -55,6 +55,9 @@ def build_parser():
     memory_commands = memory.add_subparsers(dest="memory_command", required=True)
     for name in ("summary", "owner", "workflows", "strategy"):
         memory_commands.add_parser(name).add_argument("--json", action="store_true")
+    memory_retire = memory_commands.add_parser("retire")
+    memory_retire.add_argument("memory_id")
+    memory_retire.add_argument("--json", action="store_true")
     memory_add = memory_commands.add_parser("add")
     memory_add.add_argument("--scope", required=True, choices=("workflow", "strategy"))
     memory_add.add_argument("--claim", required=True)
@@ -81,6 +84,16 @@ def build_parser():
     for name in ("list", "topology"):
         goal_commands.add_parser(name).add_argument("--json", action="store_true")
     show = goal_commands.add_parser("show"); show.add_argument("goal_id"); show.add_argument("--json", action="store_true")
+    decide = goal_commands.add_parser("decide", help="answer a parked decision_request with one bounded step")
+    decide.add_argument("goal_id")
+    decide.add_argument("--kind", required=True, choices=("execute_workflow", "request_agent"))
+    decide.add_argument("--workflow", help="candidate workflow id: <department_id>:<workflow_id>")
+    decide.add_argument("--agent", help="bounded direct work executor (goal owner or installed Agent)")
+    decide.add_argument("--instruction", help="bounded, concrete instruction for request_agent (required)")
+    decide.add_argument("--evidence-kind", dest="evidence_kind", help="evidence kind that proves the work (defaults to the goal metric)")
+    decide.add_argument("--json", action="store_true")
+    resume = goal_commands.add_parser("resume", help="open the next run of a stalled or review-parked goal")
+    resume.add_argument("goal_id"); resume.add_argument("--json", action="store_true")
     evidence = commands.add_parser("evidence")
     evidence_commands = evidence.add_subparsers(dest="evidence_command", required=True)
     add = evidence_commands.add_parser("add")
@@ -157,7 +170,7 @@ def main(argv=None):
                                          "observe", "catalog", "departments",
                                          "layout"}
                         or (args.command == "memory"
-                            and args.memory_command != "add")
+                            and args.memory_command not in {"add", "retire"})
                         or (args.command == "profile"
                             and args.profile_command == "list")
                         or (args.command == "notifications"
@@ -173,6 +186,8 @@ def main(argv=None):
                         goal_id=args.goal, run_id=args.run,
                         intervention_id=args.intervention,
                         workflow_id=args.workflow)
+                elif args.memory_command == "retire":
+                    output = runtime.retire_memory(args.memory_id)
                 else:
                     summary = runtime.clean_memory_summary()
                     output = summary if args.memory_command == "summary" else summary["durable_memory"][args.memory_command.rstrip("s")]
@@ -186,6 +201,13 @@ def main(argv=None):
                     output = runtime.create_goal(name=args.name, owner_id=args.owner, metric=args.metric, operator=args.operator, target=_json(args.target), deadline=args.deadline, parent_id=args.parent, config=config, goal_id=args.id)
                 elif args.goal_command == "list": output = runtime.goal_summaries()
                 elif args.goal_command == "topology": output = runtime.topology_audit()
+                elif args.goal_command == "decide":
+                    output = runtime.decide_goal(
+                        args.goal_id, args.kind, workflow=args.workflow,
+                        agent=args.agent, instruction=args.instruction,
+                        evidence_kind=args.evidence_kind)
+                elif args.goal_command == "resume":
+                    output = runtime.resume_goal(args.goal_id)
                 else: output = runtime.status(args.goal_id)
             elif args.command == "evidence":
                 payload = _json(args.payload)

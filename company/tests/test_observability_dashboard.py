@@ -37,14 +37,38 @@ class ObservabilityTests(unittest.TestCase):
         board = self.runtime.observe()
         self.assertEqual(board["health"]["goals"], 1)
         self.assertEqual(board["health"]["active_goals"], 1)
+        # DECIDE boundary: a departmentless goal parks a decision_request
+        # (run DECIDE/waiting) and creates no work order until the owner
+        # answers it.
+        self.assertEqual(board["health"]["open_work_orders"], 0)
+        row = next(item for item in board["goals"]
+                   if item["id"] == goal["id"])
+        self.assertEqual(row["stage"], GoalStage.DECIDE.value)
+        self.assertEqual(row["run_status"], "waiting")
+        self.assertEqual(row["open_orders"], 0)
+        self.assertTrue(board["attention"],
+                        "the parked decision_request must surface as "
+                        "attention")
+
+    def test_dashboard_renders_answered_direct_work(self):
+        """After `goal decide` answers the park, the dashboard shows the
+        host's parked work order in ACT/waiting again."""
+        from company.runtime.engine import GoalStage
+
+        goal = self.runtime.create_goal(
+            name="Answered sale", owner_id="director", metric="weekly_sales",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        self.runtime.tick(max_advances=10)
+        self.runtime.decide_goal(
+            goal["id"], "request_agent", agent="director",
+            instruction="close one deal this week")
+        board = self.runtime.observe()
         self.assertEqual(board["health"]["open_work_orders"], 1)
         row = next(item for item in board["goals"]
                    if item["id"] == goal["id"])
         self.assertEqual(row["stage"], GoalStage.ACT.value)
         self.assertEqual(row["run_status"], "waiting")
         self.assertEqual(row["open_orders"], 1)
-        self.assertTrue(board["attention"],
-                        "the parked work order must surface as attention")
 
     def test_dashboard_counts_memory_by_scope(self):
         goal = self.runtime.create_goal(
@@ -59,12 +83,30 @@ class ObservabilityTests(unittest.TestCase):
             name="Trace me", owner_id="director", metric="m",
             operator="ge", target=1, config={"aggregation": "latest"})
         self.runtime.tick(max_advances=10)
+        # DECIDE boundary: the parked run carries the decision_request,
+        # not an Intervention — the causal chain is Goal -> Run -> Decision.
         trace = self.runtime.observe(goal_id=goal["id"])
         self.assertEqual(trace["goal"]["name"], "Trace me")
         self.assertEqual(len(trace["runs"]), 1)
         run = trace["runs"][0]
+        self.assertEqual(run["stage"], "DECIDE")
+        self.assertEqual(run["interventions"], [])
+
+    def test_trace_explains_the_answered_causal_chain(self):
+        """Answering the park yields the Goal -> Run -> Intervention ->
+        WorkOrder chain the trace renders."""
+        goal = self.runtime.create_goal(
+            name="Trace the answer", owner_id="director", metric="m",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        self.runtime.tick(max_advances=10)
+        self.runtime.decide_goal(
+            goal["id"], "request_agent", agent="director",
+            instruction="produce the metric evidence")
+        trace = self.runtime.observe(goal_id=goal["id"])
+        run = trace["runs"][0]
         self.assertEqual(run["interventions"][0]["status"], "waiting")
-        self.assertIn("resolution_message", run["interventions"][0]["context"])
+        self.assertIn("resolution_message",
+                      run["interventions"][0]["context"])
 
     def test_health_projection_is_compact(self):
         self.runtime.create_goal(

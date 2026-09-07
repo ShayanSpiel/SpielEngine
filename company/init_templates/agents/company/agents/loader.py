@@ -31,10 +31,11 @@ def _candidate_roots(project_root: Path | None) -> list[Path]:
         roots.append(home / ".agents" / "company" / "agents" / "installed")
     root = Path(project_root) if project_root is not None else find_project_root()
     roots.append(root / ".agents" / "company" / "agents" / "installed")
-    # Vendored homes and flat source checkouts resolve identically here:
-    # <home>/.agents/company/agents/installed is the canonical layer. The
-    # source package keeps an empty installed/ for tests.
-    roots.append(Path(__file__).resolve().parents[1] / "installed")
+    # A flat source checkout has no .agents tree; its installed layer is
+    # the agents package's own installed/ folder — <repo>/company/agents/
+    # installed (parents[1] is the company package), anchored on this file
+    # so the probe lands beside the loader, never in a sibling of it.
+    roots.append(Path(__file__).resolve().parents[1] / "agents" / "installed")
     seen, unique = set(), []
     for item in roots:
         if item not in seen:

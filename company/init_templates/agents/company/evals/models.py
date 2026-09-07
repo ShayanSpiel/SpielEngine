@@ -142,7 +142,7 @@ class EvalReport:
 
 
 def suite_spec(suite: EvalSuite) -> dict[str, Any]:
-    """Stable serializable description used by `company eval list` and catalog."""
+    """Stable serializable suite description (embedded in every EvalRequest)."""
     return {
         "id": suite.id,
         "name": suite.name,

@@ -5,10 +5,6 @@
 //
 // - OpenCode V2 validates `default` as an object with `id` plus a `setup`
 //   (or `effect`) function — that shape is what we export.
-// - Older 1.x hosts auto-load local plugins and call every exported
-//   function; the named export keeps legacy
-//   `experimental.chat.system.transform` sessions working, and the default
-//   object also exposes setup for hosts that read `mod.default`.
 // - A server may be started from a different folder than the session it
 //   serves: never trust `ctx.location.directory` alone. Resolve the home
 //   per request from the session directory, then `.agents/company`, then
@@ -238,76 +234,7 @@ const setup = async (ctx: Any): Promise<(() => void) | undefined> => {
   return () => controller.abort()
 }
 
-// 1.x hosts auto-load local plugins and call every exported function as a
-// plugin factory; this factory registers the same projection through the
-// legacy hook surface so old sessions keep their company state.
-const SpielOSContext = async (input: Any): Promise<Any> => {
-  const directory: string = input?.directory || pluginDirectoryFallback()
-  const runCompany = companyRunner(() => directory, directory)
-  const hooks: Any = {}
-  try {
-    hooks["experimental.chat.system.transform"] =
-      async (_input: Any, output: Any) => {
-        const system = output?.system
-        if (!Array.isArray(system)) return
-        try {
-          const projection = await runCompany([
-            "context", "--owner", "director", "--json",
-          ])
-          if (typeof projection?.context !== "string" || !projection.context) {
-            throw new Error("empty context projection")
-          }
-          system.push(projection.context)
-        } catch (error) {
-          const detail =
-            error instanceof Error ? error.message : "unknown host error"
-          system.push(`${CONTEXT_FAILURE_NOTICE}: ${detail}`)
-        }
-      }
-    hooks["event"] = async ({ event }: Any) => {
-      if (event?.type !== "session.idle") return
-      const sessionID = event?.properties?.sessionID
-      if (!sessionID) return
-      try {
-        const client = input?.client
-        const rows = (await runCompany([
-          "notifications", "list", "--status", "pending",
-          "--limit", "20", "--json",
-        ])) as Any[]
-        for (const item of rows.filter((row) => REPORTABLE.has(row.kind))) {
-          const text = formatNotification(item)
-          try {
-            await client?.session?.prompt?.({
-              path: { id: sessionID },
-              query: { directory },
-              body: {
-                noReply: true,
-                parts: [{ type: "text", text, synthetic: true }],
-              },
-            })
-          } catch {
-            break
-          }
-          await runCompany(["notifications", "ack", item.id, "--json"])
-        }
-      } catch {
-        // Persistence is the fallback. Failed delivery remains pending.
-      }
-    }
-  } catch {
-    // Register nothing rather than break a legacy session.
-  }
-  return hooks
-}
-
-function pluginDirectoryFallback(): string {
-  return typeof import.meta.dir === "string" ? import.meta.dir : process.cwd()
-}
-
-// Default export satisfies the V2 schema (id + setup). The named export
-// keeps 1.x hosts loading, and hosts that call `mod.default` as a factory
-// find a function-shaped compatibility view via SpielOSContext.
+// Default export satisfies the V2 schema (id + setup).
 const plugin = { id: "spielos-notifications", setup }
 
 export default plugin
-export { SpielOSContext, setup }

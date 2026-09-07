@@ -10,7 +10,8 @@ from enum import Enum
 
 from ..agents.core import Agent, AgentEvidence, AgentExecutor
 from ..evidence import EvidenceRepository
-from ..memory import MemoryRepository
+from ..goals import GoalRepository
+from ..memory import Memory, MemoryRepository
 from ..state import Database
 from ..work_orders import WorkOrderRepository
 from ..workflows import WorkflowRepository
@@ -18,6 +19,17 @@ from ..workflows import WorkflowRepository
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+UNINSTALLED_AGENT_MESSAGE = (
+    "workflow {workflow_id} step {step_id} declares agent {agent_id!r}, "
+    "which is neither an installed Agent, nor the goal owner, nor declared "
+    "by the Department owning the workflow — refusing to execute work for "
+    "an undeclared executor")
+UNINSTALLED_DIRECT_AGENT_MESSAGE = (
+    "intervention assigns agent {agent_id!r}, which is neither an installed "
+    "Agent nor the goal owner — refusing to execute work for an undeclared "
+    "executor")
 
 
 class ResolutionOutcome(str, Enum):
@@ -146,10 +158,17 @@ class ResolutionCycle:
     """Own Workflow execution until a meaningful boundary is reached."""
 
     def __init__(self, database: Database, executor: AgentExecutor, *,
-                 agents: dict[str, Agent] | None = None, max_local_iterations: int = 50):
+                 agents: dict[str, Agent] | None = None, max_local_iterations: int = 50,
+                 department_agents: dict[str, tuple[str, ...]] | None = None):
         self.database = database
         self.executor = executor
         self.agents = dict(agents or {})
+        #: Department-declared executor ids keyed by department id (F4).
+        #: Workflow steps may execute for an agent their owning
+        #: Department declares; everything else must be installed or be
+        #: the goal owner. The CLI adapter wires this from the loaded
+        #: Department manifests.
+        self.department_agents = dict(department_agents or {})
         self.max_local_iterations = max_local_iterations
         self.interventions = InterventionRepository(database)
         self.workflows = WorkflowRepository(database)
@@ -157,13 +176,99 @@ class ResolutionCycle:
         self.evidence = EvidenceRepository(database)
         self.memory = MemoryRepository(database, self.evidence)
         self.approvals = ApprovalRepository(database)
+        self.goals = GoalRepository(database)
+
+    def _executor_is_valid(self, agent_id: str, owner_id: str,
+                           department_declared: tuple[str, ...] = ()) -> bool:
+        """F4: refuse to execute for an undeclared or uninstalled agent.
+
+        A valid executor identity is exact-string one of: an installed
+        Agent (``agents/installed`` declarations, ``self.agents``), the
+        goal owner, or — for workflow steps — an agent the owning
+        Department declares in its manifest. Every other identity
+        escalates instead of executing.
+        """
+        return (agent_id in self.agents
+                or agent_id == owner_id
+                or agent_id in (department_declared or ()))
+
+    #: How many memory claims a WorkOrder brief carries at most (L1):
+    #: the newest active claims for the work being opened, bounded so a
+    #: long-lived Workflow cannot grow its brief without limit.
+    BRIEF_MEMORY_LIMIT = 5
+
+    def _brief_memory(self, *, workflow_id: str | None = None,
+                      goal_id: str | None = None) -> list[str]:
+        """The learning one WorkOrder brief carries (L1: causal memory
+        injection).
+
+        A workflow order carries the workflow's own active workflow-scope
+        claims; a direct order carries the goal-relevant claims that are
+        not owner profile preferences. Newest first, bounded to
+        ``BRIEF_MEMORY_LIMIT`` claim strings — the executor reads the
+        claims themselves, never memory ids. Pure read.
+        """
+        if workflow_id:
+            claims = self.memory.relevant(
+                scope="workflow", workflow_id=workflow_id,
+                limit=self.BRIEF_MEMORY_LIMIT)
+        else:
+            claims = [item for item in self.memory.relevant(
+                goal_id=goal_id, limit=20) if item.scope != "owner"]
+            claims = claims[:self.BRIEF_MEMORY_LIMIT]
+        return [item.claim for item in claims]
+
+    def remember_workflow_learning(self, order, learning: str,
+                                    evidence_ids) -> Memory:
+        """The one workflow-learning writer (L4).
+
+        Both paths that persist workflow memory — the executor path (a
+        step completing with ``workflow_learning``) and the CLI ``tasks
+        --complete --learning`` flow — go through this single writer, so
+        the write shape has one authority: workflow scope, the order's
+        own evidence, full Goal/Run/Intervention lineage, and the
+        WorkflowRun's workflow_id. ``MemoryRepository.remember`` stays
+        the enforcing guard underneath.
+        """
+        workflow_id = None
+        if order.workflow_run_id:
+            with self.database.connect() as connection:
+                row = connection.execute(
+                    "SELECT workflow_id FROM core_workflow_runs WHERE id=?",
+                    (order.workflow_run_id,)).fetchone()
+            workflow_id = row[0] if row else None
+        return self.memory.remember(
+            "workflow", learning, evidence_ids=tuple(evidence_ids),
+            goal_id=order.goal_id, run_id=order.run_id,
+            intervention_id=order.intervention_id, workflow_id=workflow_id)
 
     def resolve(self, intervention_id: str) -> ResolutionResult:
         intervention = self.interventions.get(intervention_id)
         workflow_id = intervention.context.get("workflow_id")
         if not workflow_id:
             return self._resolve_direct(intervention)
+        workflow = self.workflows.get(workflow_id)
         workflow_run = self.workflows.active_for_intervention(intervention.id)
+        # F4: validate every step's declared executor BEFORE starting the
+        # workflow run or opening any WorkOrder — a step naming an agent
+        # that is neither installed, nor the goal owner, nor declared by
+        # the Department owning the workflow escalates immediately, and
+        # no order and no pre-claim is created for it. A resumed run
+        # validates its own persisted step snapshot.
+        pending_steps = (workflow_run.steps if workflow_run is not None
+                         else workflow.steps)
+        owner_id = self.goals.get(intervention.goal_id).owner_id
+        department_declared = self.department_agents.get(
+            workflow.department_id or "", ())
+        for step in pending_steps:
+            if self._executor_is_valid(step.agent_id, owner_id,
+                                       department_declared):
+                continue
+            return self._finish(
+                intervention, ResolutionOutcome.ESCALATE_TO_GOAL,
+                UNINSTALLED_AGENT_MESSAGE.format(
+                    workflow_id=workflow_id, step_id=step.id,
+                    agent_id=step.agent_id))
         if workflow_run is None:
             workflow_run = self.workflows.start(
                 workflow_id, goal_id=intervention.goal_id, run_id=intervention.run_id,
@@ -211,7 +316,9 @@ class ResolutionCycle:
                        "evidence_kinds": list(step.evidence_kinds),
                        "skill_ids": list(step.skill_ids),
                        "connection_ids": list(step.connection_ids),
-                       "requirements": dict(step.requirements)})
+                       "requirements": dict(step.requirements),
+                       "memory": self._brief_memory(
+                           workflow_id=workflow.id)})
             if order.status == "open":
                 # Claim with the bare agent id: the documented host flow
                 # (`tasks <id> --complete <agent_id>`) and the notification
@@ -230,11 +337,8 @@ class ResolutionCycle:
                     evidence_items=[(item.kind, item.payload) for item in evidence],
                     advance_workflow=True)
                 if result.workflow_learning:
-                    self.memory.remember(
-                        "workflow", result.workflow_learning,
-                        evidence_ids=evidence_ids, goal_id=intervention.goal_id,
-                        run_id=intervention.run_id, intervention_id=intervention.id,
-                        workflow_id=workflow.id)
+                    self.remember_workflow_learning(
+                        order, result.workflow_learning, evidence_ids)
                 continue
             if result.status == "fixable":
                 self.work_orders.fail(order.id, result.message or "local failure",
@@ -262,6 +366,15 @@ class ResolutionCycle:
         if not agent_id:
             return self._finish(intervention, ResolutionOutcome.ASK_USER,
                                 "intervention requires a Workflow or Agent")
+        # F4: refuse direct work for an executor that is neither installed
+        # nor the goal owner BEFORE opening any WorkOrder. Department
+        # declarations never cover direct assignments — the owner or an
+        # installed Agent executes those.
+        owner_id = self.goals.get(intervention.goal_id).owner_id
+        if not self._executor_is_valid(agent_id, owner_id):
+            return self._finish(
+                intervention, ResolutionOutcome.ESCALATE_TO_GOAL,
+                UNINSTALLED_DIRECT_AGENT_MESSAGE.format(agent_id=agent_id))
         with self.database.connect() as connection:
             completed = connection.execute("""SELECT work.id
                 FROM core_work_orders AS work
@@ -281,7 +394,9 @@ class ResolutionCycle:
                 intervention_id=intervention.id, agent_id=agent_id,
                 step_id="direct", brief={"instruction": intervention.description,
                                          "evidence_kind": intervention.context.get(
-                                             "evidence_kind", "intervention_result")})
+                                             "evidence_kind", "intervention_result"),
+                                         "memory": self._brief_memory(
+                                             goal_id=intervention.goal_id)})
             if order.status == "open":
                 order = self.work_orders.claim(order.id, agent_id)
             result = self.executor.execute(self.agents.get(agent_id, Agent(agent_id)), order)

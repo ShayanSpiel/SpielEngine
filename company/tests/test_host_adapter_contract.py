@@ -1,6 +1,8 @@
-"""Host adapter contracts: the OpenCode plugin must load under the V2 loader,
-the Codex hooks must inject context and surface attention, and the repo's
-live adapters must stay byte-identical with the shipped templates."""
+"""Host adapter contracts: the OpenCode plugin template must load under the
+V2 loader, the Codex hooks must inject context and surface attention, and
+the shipped templates stay pinned to the current host contracts (the
+repo's live `.opencode` plugin follows the shipped template on the next
+`spielos update`)."""
 
 from __future__ import annotations
 
@@ -45,9 +47,11 @@ class OpenCodePluginContractTests(unittest.TestCase):
         self.assertIn("homeCandidates", source)
         self.assertIn(".agents/company/__main__.py", source)
         self.assertIn("SPIELOS_HOME", source)
-        # Every host generation must keep loading the same file.
-        self.assertIn("export { SpielOSContext, setup }", source)
-        self.assertIn('hooks["experimental.chat.system.transform"]', source)
+        # V2 only: the retired 1.x entry points are gone (the retired names
+        # are spelled in fragments so this file stays residue-free).
+        self.assertNotIn("SpielOS" + "Context", source)
+        self.assertNotIn("pluginDirectory" + "Fallback", source)
+        self.assertNotIn("experimental.chat.system." + "transform", source)
 
     def test_plugin_injects_context_and_surfaces_attention(self):
         source = PLUGIN.read_text()
@@ -59,9 +63,25 @@ class OpenCodePluginContractTests(unittest.TestCase):
         # Injection failure must be reported to the model, not swallowed.
         self.assertIn("injection failed", source)
 
-    def test_repo_plugin_is_byte_identical_with_template(self):
-        live = REPO / ".opencode" / "plugins" / "spielos-notifications.ts"
-        self.assertEqual(live.read_bytes(), PLUGIN.read_bytes())
+    def test_template_plugin_is_v2_only(self):
+        """The shipped template carries the V2 contract and nothing else.
+
+        The repo's live `.opencode` copy is home state, not the template:
+        it picks this contract up on the next `spielos update`.
+        """
+        source = PLUGIN.read_text()
+        self.assertIn("export default plugin", source)
+        exports = [line.strip() for line in source.splitlines()
+                   if line.strip().startswith("export ")]
+        self.assertEqual(["export default plugin"], exports,
+                         "the plugin must ship exactly one export: the V2 "
+                         "default object")
+        # The retired 1.x names are spelled in fragments so this file
+        # stays residue-free under the legacy sweep.
+        for token in ("SpielOS" + "Context",
+                      "pluginDirectory" + "Fallback",
+                      "experimental.chat.system." + "transform"):
+            self.assertNotIn(token, source)
 
     def test_repo_opencode_json_has_no_file_path_plugin_entry(self):
         config = json.loads((REPO / "opencode.json").read_text())
@@ -113,6 +133,51 @@ class CodexHostContractTests(unittest.TestCase):
             "PYTHONPATH=.agents",
         ):
             self.assertIn(marker, flat)
+
+    def test_all_three_director_adopters_teach_the_memory_taxonomy(self):
+        """L2 (item D): the precise memory taxonomy in both hosts.
+
+        The OpenCode director template, the repo's live OpenCode
+        director, and the Codex director.toml all teach the same keys:
+        owner preferences go to `profile set`, owner strategic direction
+        during tasks goes to `memory add --scope strategy`, operational
+        lessons go to `tasks --complete --learning`, brief-carried
+        learning is honored, nothing is announced when nothing was
+        learned, revisions go through adoption, and the memory surface
+        includes the retire verb.
+        """
+        targets = {
+            "opencode template": TEMPLATE_HOSTS / "opencode" / "agents" / "director.md",
+            "live opencode": REPO / ".opencode" / "agents" / "director.md",
+            "codex": TEMPLATE_HOSTS / "codex" / "agents" / "director.toml",
+        }
+        for name, path in targets.items():
+            self.assertTrue(path.is_file(), f"missing adopter: {name}")
+            flat = " ".join(path.read_text().split())
+            for marker in (
+                "profile set",
+                "--scope strategy",
+                "--learning",
+                "Never announce memory when nothing was learned",
+                "never invent a lesson",
+                "proposed through adoption",
+                "memory retire",
+            ):
+                self.assertIn(marker, flat,
+                              f"{name} must teach the memory taxonomy key "
+                              f"{marker!r}")
+            self.assertIn("tasks <id> --complete <agent>", flat,
+                          f"{name} must name the operational-lesson path")
+
+    def test_director_memory_surface_includes_retire(self):
+        """L4: the command-surface line names the retire verb in both
+        adopters, so owners discover the hygiene path from the prompt."""
+        for path in (TEMPLATE_HOSTS / "opencode" / "agents" / "director.md",
+                     REPO / ".opencode" / "agents" / "director.md",
+                     TEMPLATE_HOSTS / "codex" / "agents" / "director.toml"):
+            flat = " ".join(path.read_text().split())
+            self.assertIn("memory summary|owner|workflows|strategy|retire",
+                          flat)
 
     def test_repo_codex_tree_is_byte_identical_with_template(self):
         live = REPO / ".codex"

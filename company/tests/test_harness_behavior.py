@@ -10,8 +10,9 @@ product still carries zero departments by design.
 The original suite pinned eight defects as KNOWN-DEFECT tests; those pins
 are inverted here because D1–D8 are fixed in this source tree:
 
-- D1 executor identity: orders are claimed with the bare agent id; the
-  historical ``executor:<agent_id>`` claimant is accepted as a synonym.
+- D1 executor identity: orders are claimed and completed with the bare
+  agent id — the exact stored claimant string; no alias spelling is
+  accepted.
 - D2 memory writes: ``tasks --complete --learning`` and ``memory add``
   persist workflow/strategy memory through the lineage-enforcing remember().
 - D3 undeclared metrics: ``goal create`` rejects metrics the owner
@@ -26,6 +27,20 @@ are inverted here because D1–D8 are fixed in this source tree:
   approved instead of parking a work order.
 - D8 readonly snapshots: cached per (path, mtime, size); the database
   file stays byte-for-byte untouched.
+
+Audit F5+F6 pins (goal-decide-stall):
+
+- F5 decision identity: a flat metric with the identical repeated
+  decision parks at stall_threshold even when each run records evidence;
+  a changed decision chains; a fixable executor that exhausts its local
+  budget repeatedly parks after the escalation threshold consecutive
+  exhaustions.
+- F6 DECIDE decides from run history: a candidate workflow whose most
+  recent execution on the goal left the metric flat is excluded, the
+  first remaining candidate in declaration order runs, and an empty
+  candidate set parks a decision_request. decide() never writes the
+  Workflow definition; the controller/executor seams are injectable and
+  GoalContext carries children, blockers, and the recent decisions.
 
 Run:  PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest \\
           company.tests.test_harness_behavior -v
@@ -70,7 +85,12 @@ from company.commands.goal_runtime import (  # noqa: E402
     CleanCommandRuntime,
 )
 from company.context.core import codex_hook_output  # noqa: E402
-from company.runtime.engine import GoalRuntime, GoalStage  # noqa: E402
+from company.runtime.engine import (  # noqa: E402
+    Decision,
+    Evaluation,
+    GoalRuntime,
+    GoalStage,
+)
 from company.runtime.registry import departments  # noqa: E402
 from company.runtime.util import compare  # noqa: E402
 from company.state import Database  # noqa: E402
@@ -156,6 +176,24 @@ class HarnessCase(unittest.TestCase):
                 return True
         return predicate()
 
+    def decide_bounded_work(self, instruction="produce the metric evidence",
+                            agent="director", evidence_kind=None):
+        """Answer a parked decision_request with bounded direct work (the
+        DECIDE boundary: direct work exists only after the owner names it)."""
+        return self.runtime.decide_goal(
+            self.goal_id, "request_agent", agent=agent,
+            instruction=instruction, evidence_kind=evidence_kind)
+
+    def park_bounded_direct_work(self, instruction="produce the metric evidence",
+                                 agent="director", evidence_kind=None):
+        """Tick to the DECIDE park, answer it, and return the parked order."""
+        self.tick_until(lambda: (self.current_run().stage == GoalStage.DECIDE
+                                 and self.current_run().status == "waiting"))
+        self.decide_bounded_work(instruction, agent, evidence_kind)
+        orders = self.active_orders()
+        assert orders, "answering the decision_request must park the work order"
+        return orders[0]
+
     def current_run(self):
         return self.runtime.runs.current(self.goal_id)
 
@@ -228,15 +266,19 @@ class TestGoalLoopLifecycle(HarnessCase):
                       "the error must list the declared metrics")
 
     def test_advance_parks_work_order_for_host_when_no_department(self):
+        # DECIDE boundary: a departmentless goal the runtime cannot decide
+        # parks a decision_request for the owner instead of inventing
+        # content-free bounded work.
         self.new_goal(name="Weekly sales", owner="director", metric="weekly_sales")
         self.runtime.tick(max_advances=10)
         run = self.current_run()
-        self.assertEqual((run.stage, run.status), (GoalStage.ACT, "waiting"))
-        orders = self.active_orders()
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0]["agent_id"], "director",
-                         "a departmentless goal parks a direct work order "
-                         "for the Director; nothing executes implicitly")
+        self.assertEqual((run.stage, run.status), (GoalStage.DECIDE, "waiting"))
+        self.assertEqual(run.decision.kind, "decision_request")
+        self.assertEqual(self.active_orders(), [],
+                         "no content-free work order may exist for a park")
+        attention = self.runtime.attention(goal_id=self.goal_id)
+        self.assertEqual(len(attention), 1)
+        self.assertIn("Weekly sales", attention[0]["message"])
 
     def test_stage_persistence_is_one_step_per_advance(self):
         self.new_goal(owner="seo", metric="keyword_opportunities", target=1,
@@ -390,6 +432,109 @@ class TestWorkflowExecution(HarnessCase):
         if learned:
             self.assertIsNotNone(learned[0]["run_id"])
 
+    def test_deterministic_completion_writes_no_new_strategy_memory(self):
+        # F7(c) pin — strategy memory stays selective: the deterministic
+        # CatalogController never fabricates strategy_learning, so a goal
+        # driven to completion end to end writes ZERO new strategy rows
+        # (owner direction or evidence-backed host distillation remain the
+        # only strategy writers). Uses the gate-free keyword-research
+        # flow so the deterministic loop can complete on its own.
+        seo_goal = self.runtime.create_goal(
+            name="Map opportunities", owner_id="seo",
+            metric="keyword_opportunities", operator="ge", target=1,
+            config={"aggregation": "count", "workflow": "keyword-research"})
+        goal_id = seo_goal["id"]
+        with self.runtime.connect() as connection:
+            before = connection.execute(
+                "SELECT COUNT(*) FROM core_memory WHERE scope='strategy'"
+            ).fetchone()[0]
+        self.engine.resolution.executor = completing_executor(
+            payload={"keyword_opportunities": 1})
+        done = self.tick_until(
+            lambda: self.runtime.goals.get(goal_id).status == "complete")
+        self.assertTrue(done, "the goal must complete for the pin to bite")
+        with self.runtime.connect() as connection:
+            after = connection.execute(
+                "SELECT COUNT(*) FROM core_memory WHERE scope='strategy'"
+            ).fetchone()[0]
+        self.assertEqual(before, after,
+                         "completing a goal via the deterministic controller "
+                         "must write no new strategy memory")
+
+    def test_parked_workflow_ask_carries_workflow_memory(self):
+        # F7(b) pins: the parked workflow ask omits the learning line while
+        # no workflow memory exists, then carries it once a step's
+        # --learning persists workflow memory — rendered by the
+        # AssignmentExecutor's message, and by the engine's ASK_USER
+        # payload for any executor that omits it (a scripted host below).
+        # L1 (intentional extension): the WorkOrder BRIEF carries the
+        # workflow's active claims in its bounded `memory` key too — the
+        # ask text renders the learning for the owner, the brief carries
+        # it for the executor, and the next workflow order's brief is
+        # where learning becomes causal.
+        self.tick_until(lambda: self.active_orders())
+        first = self.active_orders()[0]
+        asks = self.runtime.notifications(goal_id=self.goal_id)
+        self.assertEqual(len(asks), 1)
+        self.assertNotIn("Workflow learning:",
+                          asks[0]["payload"]["message"],
+                          "with no workflow memory recorded the line is "
+                          "absent")
+        self.assertEqual(first["brief"]["memory"], [],
+                         "the first execution's brief carries no learning")
+        self.runtime.complete_work_order(
+            first["id"], first["agent_id"],
+            [{"kind": "intervention_result", "payload": {}}],
+            learning="warm intros convert better than cold blasts")
+        self.engine.resolution.executor = ScriptedExecutor([])
+        self.tick_until(lambda: self.active_orders())
+        orders = self.runtime.work_orders(goal_id=self.goal_id, limit=20)
+        taught = [order for order in orders
+                  if order["id"] != first["id"]
+                  and order["status"] in ("open", "claimed")]
+        self.assertTrue(taught,
+                        "completing one step must park the workflow's next "
+                        "step for the taught brief to exist")
+        self.assertIn("warm intros convert better than cold blasts",
+                      taught[-1]["brief"]["memory"],
+                      "the next WorkOrder brief carries the workflow's "
+                      "recorded learning")
+        asks = self.runtime.notifications(goal_id=self.goal_id)
+        self.assertEqual(len(asks), 1, "one ask per parked step")
+        message = asks[0]["payload"]["message"]
+        self.assertIn("Workflow learning:", message)
+        self.assertIn("warm intros convert better than cold blasts", message,
+                      "the step's --learning reaches the next parked ask")
+
+    def test_approve_acknowledges_the_answered_ask_and_resumes(self):
+        # F9(a) pin: approving a parked approval ask retires its pending
+        # notification (an approved ask stops re-delivering) BEFORE the
+        # run resumes, so only a new gate's ask can reappear as pending.
+        # The completing executor is installed before the approve: the
+        # resumed run executes the approved send step synchronously
+        # inside the approve call itself.
+        self.engine.resolution.executor = completing_executor(payload={})
+        self.tick_until(lambda: self.runtime.attention(goal_id=self.goal_id))
+        pending = self.runtime.notifications(goal_id=self.goal_id)
+        self.assertEqual(len(pending), 1)
+        notification_id = pending[0]["id"]
+        self.engine.resolution.executor = completing_executor(
+            payload={"email_batches_sent": 1})
+        self.runtime.approve(self.goal_id, keys=("send",))
+        with self.runtime.connect() as connection:
+            status = connection.execute(
+                "SELECT status FROM core_notifications WHERE id=?",
+                (notification_id,)).fetchone()[0]
+        self.assertEqual(status, "acknowledged",
+                         "the approved ask is acknowledged, not re-delivered")
+        self.assertEqual(self.runtime.notifications(goal_id=self.goal_id), [],
+                         "no pending ask remains after the approval")
+        # And the run resumed: the approved send step executed and the
+        # workflow can complete the goal.
+        proceeded = self.tick_until(
+            lambda: self.runtime.goals.get(self.goal_id).status == "complete")
+        self.assertTrue(proceeded, "the approved run must resume and proceed")
+
     def test_tasks_complete_learning_persists_workflow_memory(self):
         # D2 fixed: the documented host flow can write workflow memory.
         # Park the first workflow step for the host (as AssignmentExecutor
@@ -528,6 +673,41 @@ class TestMemoryBehavior(HarnessCase):
         self.assertNotIn("workflow", [m.scope for m in without_workflow],
                          "workflow memory applies only with its workflow_id")
 
+    def test_sibling_goal_strategy_learning_is_relevant(self):
+        # F7(a) pin: an active strategy claim from a sibling goal — same
+        # owner and same metric — is relevant to THIS goal (sibling-goal
+        # learning), while an unrelated goal's strategy claim is not.
+        sibling = self.runtime.create_goal(
+            name="Sibling goal", owner_id="director", metric="m",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        unrelated = self.runtime.create_goal(
+            name="Unrelated goal", owner_id="director", metric="m_other",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        foreign_owner = self.runtime.create_goal(
+            name="Foreign-owner goal", owner_id="seo-owner", metric="m",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        sibling_run = self.runtime.runs.current(sibling["id"])
+        sibling_evidence = self.runtime.evidence.record(
+            goal_id=sibling["id"], run_id=sibling_run.id, kind="m",
+            payload={"m": 1})
+        self.runtime.memory.remember(
+            "strategy", "sibling goal learned this already",
+            evidence_ids=(sibling_evidence.id,), goal_id=sibling["id"],
+            run_id=sibling_run.id)
+        sibling_claims = [item.claim for item in self.runtime.memory.relevant(
+            goal_id=self.goal_id, limit=20)]
+        self.assertIn("sibling goal learned this already", sibling_claims,
+                      "strategy claims from a same-owner, same-metric goal "
+                      "reach the sibling's relevant memory")
+        unrelated_claims = [item.claim for item in self.runtime.memory.relevant(
+            goal_id=unrelated["id"], limit=20)]
+        self.assertNotIn("sibling goal learned this already", unrelated_claims,
+                          "a different metric is an unrelated goal")
+        foreign_claims = [item.claim for item in self.runtime.memory.relevant(
+            goal_id=foreign_owner["id"], limit=20)]
+        self.assertNotIn("sibling goal learned this already", foreign_claims,
+                          "a different owner is an unrelated goal")
+
     def test_strategy_memory_written_by_goal_evaluation_with_evidence(self):
         evidence = self._evidence()
         from company.runtime.engine import Evaluation
@@ -591,12 +771,16 @@ class TestMemoryBehavior(HarnessCase):
             self.engine.controller = original
 
     def _drive_to_evaluate(self):
-        """Park the direct work order, answer it, and land on the
-        EVALUATE/running boundary where the guard probe can act."""
+        """Park the DECIDE ask, answer it with bounded direct work, complete
+        the parked order, and land on the EVALUATE/running boundary where
+        the guard probe can act."""
         self.engine.resolution.executor = ScriptedExecutor([])
         for _ in range(12):
             self.runtime.tick(max_advances=30)
             run = self.current_run()
+            if (run.stage == GoalStage.DECIDE and run.status == "waiting"):
+                self.decide_bounded_work()
+                run = self.current_run()
             if run.stage == GoalStage.EVALUATE and run.status == "running":
                 return
             if run.status == "waiting":
@@ -610,6 +794,62 @@ class TestMemoryBehavior(HarnessCase):
         run = self.current_run()
         self.assertEqual((run.stage, run.status),
                          (GoalStage.EVALUATE, "running"))
+
+    def test_direct_ask_carries_goal_relevant_memory(self):
+        # F7(b) pin: a direct (non-workflow) parked ask carries the goal's
+        # relevant memory claims instead of workflow learning.
+        # L1 (intentional extension): the WorkOrder BRIEF carries the same
+        # goal-relevant claims in its bounded `memory` key, so an executor
+        # that reads the brief (not only the ask text) still gets them.
+        self.runtime.memory.remember(
+            "strategy", "call the champion before the close",
+            evidence_ids=(self._evidence(payload={"m": 0}).id,),
+            goal_id=self.goal_id, run_id=self.run_id)
+        order = self.park_bounded_direct_work(instruction="close one deal")
+        self.assertEqual(order["step_id"], "direct")
+        self.assertIn("call the champion before the close",
+                      order["brief"]["memory"],
+                      "the direct order's brief carries the goal-relevant "
+                      "claims for the executor")
+        asks = self.runtime.notifications(goal_id=self.goal_id)
+        self.assertEqual(len(asks), 1)
+        message = asks[0]["payload"]["message"]
+        self.assertIn("Relevant memory: call the champion before the close",
+                      message,
+                      "the direct ask carries the goal's relevant claims")
+
+    def test_direct_ask_omits_the_memory_line_when_no_claims_exist(self):
+        # F7(b): with no goal-relevant claims recorded, the direct ask
+        # omits the line cleanly.
+        # L1 (intentional extension): the brief's `memory` key stays an
+        # empty bounded list — the empty case is a stable shape, not a
+        # missing key.
+        order = self.park_bounded_direct_work(instruction="close one deal")
+        self.assertEqual(order["brief"]["memory"], [],
+                         "no claims recorded means no claims carried")
+        asks = self.runtime.notifications(goal_id=self.goal_id)
+        self.assertEqual(len(asks), 1)
+        self.assertNotIn("Relevant memory:", asks[0]["payload"]["message"])
+        self.assertNotIn("Workflow learning:", asks[0]["payload"]["message"])
+
+    def test_engine_direct_ask_appends_goal_relevant_memory(self):
+        # F7(b): the engine's ASK_USER payload carries the goal-relevant
+        # claims even when the executor's message omits them (a scripted
+        # host executor parks without reading memory).
+        self.runtime.memory.remember(
+            "strategy", "call the champion before the close",
+            evidence_ids=(self._evidence(payload={"m": 0}).id,),
+            goal_id=self.goal_id, run_id=self.run_id)
+        self.engine.resolution.executor = ScriptedExecutor([])
+        self.park_bounded_direct_work(instruction="close one deal")
+        message = self.runtime.notifications(
+            goal_id=self.goal_id)[0]["payload"]["message"]
+        self.assertIn("is ready for Agent", message,
+                      "the scripted executor's message is the base")
+        self.assertIn("Relevant memory: call the champion before the close",
+                      message,
+                      "the engine's ask payload appends the goal-relevant "
+                      "claims the executor omitted")
 
     def test_memory_add_writes_workflow_and_strategy_with_lineage(self):
         # D2 fixed: `memory add` reaches both scopes with the engine guards.
@@ -723,9 +963,13 @@ class TestWorkOrderContract(HarnessCase):
     def setUp(self):
         super().setUp()
         self.new_goal(metric="m")
-        self.runtime.tick(max_advances=10)  # parks one direct work order
-        self.order_row = self.active_orders()[0]
-        self.order_id = self.order_row["id"]
+        # DECIDE boundary: the departmentless goal first parks a
+        # decision_request; answering it with bounded direct work is what
+        # parks the order every D1 identity test runs against.
+        order = self.park_bounded_direct_work(
+            instruction="produce the metric evidence")
+        self.order_row = order
+        self.order_id = order["id"]
 
     def test_runtime_claims_orders_with_the_bare_agent_id(self):
         # D1 fixed: the runtime claims with the agent id the notification
@@ -744,14 +988,19 @@ class TestWorkOrderContract(HarnessCase):
         self.assertEqual(run.stage, GoalStage.EVALUATE,
                          "direct completion must wake the run into EVALUATE")
 
-    def test_complete_with_executor_prefix_identity_succeeds(self):
-        # D1 compatibility: the historical 'executor:<agent>' claimant is
-        # accepted as a synonym, so older homes never wedge.
-        self.runtime.complete_work_order(
-            self.order_id, "executor:director",
-            [{"kind": "m", "payload": {"m": 1}}])
-        run = self.current_run()
-        self.assertEqual(run.stage, GoalStage.EVALUATE)
+    def test_complete_with_executor_prefix_identity_is_refused(self):
+        # D1 pinned to the current contract: claimant identity is the
+        # exact stored claimed_by string. The historical 'executor:<agent>'
+        # spelling names a different claimant, so completing with it must
+        # raise — only the bare agent id (or the goal owner) completes.
+        with self.assertRaises(RuntimeError):
+            self.runtime.complete_work_order(
+                self.order_id, "executor:director",
+                [{"kind": "m", "payload": {"m": 1}}])
+        order = self.runtime.work_order(self.order_id)
+        self.assertEqual(order["status"], "claimed",
+                         "the refused completion must leave the order "
+                         "untouched for its real claimant")
 
     def test_complete_with_wrong_identity_is_refused(self):
         with self.assertRaises(RuntimeError):
@@ -787,6 +1036,121 @@ class TestWorkOrderContract(HarnessCase):
         done = self.runtime.complete_work_order(
             self.order_id, "director", [{"kind": "m", "payload": {"m": 1}}])
         self.assertEqual(done["work_order"]["status"], "completed")
+
+    def test_expired_lease_cannot_be_stolen_by_a_foreign_agent(self):
+        # F4: the lease/steal behavior survives, but an expired claim is
+        # re-claimable only by the declared agent — a foreign identity is
+        # refused even when the lease has lapsed.
+        with self.runtime.connect() as connection:
+            connection.execute(
+                "UPDATE core_work_orders SET lease_expires_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", self.order_id))
+        with self.assertRaises(RuntimeError) as caught:
+            self.runtime.claim_work_order(self.order_id, "someone-else")
+        self.assertIn("declared for agent 'director'", str(caught.exception))
+        order = self.runtime.work_order(self.order_id)
+        self.assertEqual((order["status"], order["claimed_by"]),
+                         ("claimed", "director"),
+                         "the refused steal must leave the order for its "
+                         "declared agent")
+
+    def test_foreign_claimant_claim_and_complete_are_refused(self):
+        # F4: a foreign identity can neither claim nor complete an order
+        # that belongs to its declared agent.
+        with self.assertRaises(RuntimeError) as caught:
+            self.runtime.claim_work_order(self.order_id, "someone-else")
+        self.assertIn("declared for agent 'director'", str(caught.exception))
+        with self.assertRaises(RuntimeError):
+            self.runtime.complete_work_order(
+                self.order_id, "someone-else",
+                [{"kind": "m", "payload": {"m": 1}}])
+        order = self.runtime.work_order(self.order_id)
+        self.assertEqual((order["status"], order["claimed_by"]),
+                         ("claimed", "director"),
+                         "the refused attempts must leave the order "
+                         "untouched for its declared agent")
+
+    def test_owner_cannot_claim_a_workflow_step_order_for_another_agent(self):
+        # F4: no owner override. A workflow step's order belongs to its
+        # declared agent; even the goal owner is a foreign claimant there.
+        from company.workflows import WorkflowRepository
+        from company.resolution.core import InterventionRepository
+        from company.work_orders import WorkOrderRepository
+        database = Database(self.db)
+        WorkflowRepository(database).save(Workflow(
+            "f4-owner-flow", "F4 owner-override refusal", (
+                WorkflowStep("step-one", "worker-agent", "do the step",
+                             evidence_kind="m"),)))
+        run = self.current_run()
+        intervention = InterventionRepository(database).create(
+            goal_id=self.goal_id, run_id=run.id, kind="execute_workflow",
+            description="F4 owner-override refusal",
+            context={"workflow_id": "f4-owner-flow"})
+        workflow_run = WorkflowRepository(database).start(
+            "f4-owner-flow", goal_id=self.goal_id, run_id=run.id,
+            intervention_id=intervention.id)
+        repo = WorkOrderRepository(database)
+        order = repo.open(
+            goal_id=self.goal_id, run_id=run.id,
+            intervention_id=intervention.id,
+            workflow_run_id=workflow_run.id, step_id="step-one",
+            agent_id="worker-agent",
+            brief={"instruction": "do the step", "evidence_kind": "m"})
+        for action in (lambda: repo.claim(order.id, "director"),
+                       lambda: repo.complete(order.id, {"done": True},
+                                              executor_id="director"),
+                       lambda: repo.fail(order.id, "boom",
+                                         executor_id="director"),
+                       lambda: repo.renew(order.id, "director"),
+                       lambda: repo.complete_with_evidence(
+                           order.id, {"done": True}, executor_id="director",
+                           kind="m", payload={"m": 1})):
+            with self.assertRaises(RuntimeError, msg=action) as caught:
+                action()
+            self.assertIn("declared for agent 'worker-agent'",
+                          str(caught.exception))
+        claimed = repo.claim(order.id, "worker-agent")
+        self.assertEqual((claimed.status, claimed.claimed_by),
+                         ("claimed", "worker-agent"),
+                         "the declared agent claims its own order")
+
+    def test_open_order_is_not_auto_claimed_at_completion(self):
+        # F4: the documented flow is claim-then-complete. Completing an
+        # open order raises instead of silently claiming it under an
+        # arbitrary identity.
+        with self.runtime.connect() as connection:
+            connection.execute(
+                "UPDATE core_work_orders SET status='open',claimed_by=NULL,"
+                "claimed_at=NULL,lease_expires_at=NULL WHERE id=?",
+                (self.order_id,))
+        with self.assertRaises(RuntimeError) as caught:
+            self.runtime.complete_work_order(
+                self.order_id, "director", [{"kind": "m", "payload": {"m": 1}}])
+        self.assertIn("claim it with", str(caught.exception))
+        self.assertEqual(
+            self.runtime.work_order(self.order_id)["status"], "open",
+            "the refused completion must leave the order open")
+
+    def test_declared_agent_claim_then_complete_flow(self):
+        # F4: the declared agent's end-to-end flow — claim, then complete
+        # — works and wakes the run.
+        self.runtime.complete_work_order(
+            self.order_id, "director", [{"kind": "m", "payload": {"m": 1}}])
+        self.assertEqual(
+            self.runtime.work_order(self.order_id)["status"], "completed")
+        self.assertEqual(self.current_run().stage, GoalStage.EVALUATE,
+                         "completing the claimed order wakes the run")
+
+    def test_owner_completes_direct_order_whose_agent_is_the_owner(self):
+        # F4: direct orders whose declared agent IS the goal owner are
+        # completed by the owner by construction — that is the declared
+        # agent executing, not an override.
+        order = self.runtime.work_order(self.order_id)
+        self.assertEqual(order["agent_id"], "director",
+                         "the departmentless direct order declares the owner")
+        result = self.runtime.complete_work_order(
+            self.order_id, "director", [{"kind": "m", "payload": {"m": 1}}])
+        self.assertEqual(result["work_order"]["status"], "completed")
 
     def test_completion_requires_evidence(self):
         with self.assertRaises(ValueError):
@@ -824,8 +1188,7 @@ class TestNotificationsAndAttention(HarnessCase):
             self.runtime.acknowledge_notification(item["id"])
 
     def test_workflow_completion_acknowledges_pending_attention(self):
-        self.runtime.tick(max_advances=10)
-        order = self.active_orders()[0]
+        order = self.park_bounded_direct_work()
         self.runtime.complete_work_order(
             order["id"], "director",
             [{"kind": "m", "payload": {"m": 1}}])
@@ -840,8 +1203,7 @@ class TestNotificationsAndAttention(HarnessCase):
         self.assertEqual(snapshot["counts"]["active"], 1)
 
     def test_unread_results_surface_completed_runs(self):
-        self.runtime.tick(max_advances=10)
-        order = self.active_orders()[0]
+        order = self.park_bounded_direct_work()
         self.runtime.complete_work_order(
             order["id"], "director",
             [{"kind": "m", "payload": {"m": 1}}])
@@ -903,8 +1265,11 @@ class TestRegistries(unittest.TestCase):
         self.assertTrue(compare(1, "le", 1))
         self.assertTrue(compare(2, "eq", 2))
         self.assertFalse(compare(1, "gt", 2))
-        self.assertFalse(compare(1, "unknown-op", 0),
-                         "unknown operator must fail closed")
+        # F9(c): an unknown operator raises instead of silently failing
+        # closed — a typo must surface, not read as "target missed".
+        with self.assertRaises(ValueError) as caught:
+            compare(1, "bogus", 0)
+        self.assertIn("bogus", str(caught.exception))
 
     def test_installed_agents_load_into_the_resolution_cycle(self):
         # D6 fixed: installed agent declarations reach the cycle. The layer
@@ -930,6 +1295,32 @@ class TestRegistries(unittest.TestCase):
         self.assertEqual(agent.produces, ("seo_audit", "seo_report"))
         self.assertNotIn("broken", agents,
                          "an unparseable declaration is skipped, not fatal")
+
+    def test_flat_checkout_fallback_finds_the_source_installed_layer(self):
+        # A flat source checkout has no .agents tree: its installed layer
+        # is the agents package's own installed/ folder. A declaration
+        # placed there must be visible to available_agents() when the
+        # probed home has no .agents layer of its own.
+        import company.agents.loader as loader
+        from company.agents import available_agents
+        installed = Path(loader.__file__).resolve().parent / "installed"
+        declaration = installed / "loader-pin-declaration.json"
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                installed.mkdir(parents=True, exist_ok=True)
+                declaration.write_text(json.dumps(
+                    {"id": "loader-pin-agent", "skill_ids": ["pin"]}))
+                # The probe order must end at the source checkout's own
+                # agents/installed, never at a sibling of the package.
+                self.assertEqual(installed, loader._candidate_roots(
+                    Path(directory))[-1])
+                agents = available_agents(Path(directory))
+            finally:
+                declaration.unlink(missing_ok=True)
+        self.assertIn("loader-pin-agent", agents,
+                      "available_agents() must find a declaration placed "
+                      "in company/agents/installed under a source-checkout "
+                      "layout")
 
     def test_runtime_passes_installed_agents_to_resolution(self):
         # D6 wiring: CleanCommandRuntime plumbs available_agents() through
@@ -1015,10 +1406,15 @@ class TestResolutionOutcomes(HarnessCase):
         self.new_goal(metric="m")
 
     def _drive_with(self, script, budget=15):
+        """Drive the departmentless goal, answering each DECIDE park with
+        bounded direct work so the scripted executor actually runs."""
         self.engine.resolution.executor = ScriptedExecutor(script)
         for _ in range(budget):
             self.runtime.tick(max_advances=30)
             run = self.current_run()
+            if run.stage == GoalStage.DECIDE and run.status == "waiting":
+                self.decide_bounded_work()
+                run = self.current_run()
             if run.status in {"waiting", "complete"} or run.sequence > 1:
                 return run
         return self.current_run()
@@ -1046,12 +1442,19 @@ class TestResolutionOutcomes(HarnessCase):
 
     def test_repeated_escalation_parks_after_threshold(self):
         # D4 fixed (inverted pin): three consecutive escalations park the
-        # goal for the owner instead of spinning new runs forever.
+        # goal for the owner instead of spinning new runs forever. Each
+        # new run first parks a DECIDE ask (the DECIDE boundary), which the
+        # driver answers with bounded direct work.
         from company.runtime.engine import ESCALATION_PARK_THRESHOLD
         self.engine.resolution.executor = ScriptedExecutor(
             [AgentResult("escalate", message="boom")] * 200)
         for _ in range(40):
             self.runtime.tick(max_advances=50)
+            run = self.current_run()
+            if run.stage == GoalStage.DECIDE and run.status == "waiting":
+                self.decide_bounded_work()
+            elif run.status == "waiting":
+                break  # the escalation park
         runs = len(self.runtime.runs._get_all(self.goal_id)) \
             if hasattr(self.runtime.runs, "_get_all") else None
         with self.runtime.connect() as connection:
@@ -1097,6 +1500,611 @@ class TestResolutionOutcomes(HarnessCase):
             self.runtime.tick(max_advances=30)
         run = self.current_run()
         self.assertIn(run.status, {"waiting", "ready", "running"})
+
+
+# =========================================================================
+# 9a. DECIDE DECIDES FROM RUN HISTORY + INJECTABLE SEAMS (audit F6)
+# =========================================================================
+
+HISTORY_LAB_DEPARTMENT = '''"""Minimal two-candidate Department for the DECIDE-from-history pins."""
+
+from __future__ import annotations
+
+from ...workflows import Workflow, WorkflowStep
+
+
+class HistoryLabDepartment:
+    department_id = "history-lab"
+    id = "history-lab"
+    version = "1.0.0"
+    description = "two candidate workflows for run-history decisions"
+    agent_ids = ("director",)
+    workflows = (
+        Workflow("alpha", "Workflow A", (
+            WorkflowStep("a-one", "director", "run workflow A",
+                         evidence_kind="twin_metric"),),
+            department_id="history-lab"),
+        Workflow("beta", "Workflow B", (
+            WorkflowStep("b-one", "director", "run workflow B",
+                         evidence_kind="twin_metric"),),
+            department_id="history-lab"),
+    )
+    evidence_metrics = {"twin_metric": ("twin_metric",)}
+    goal_schema = {"metrics": ["twin_metric"]}
+'''
+
+
+@with_departments
+class TestDecideFromHistory(HarnessCase):
+    """F6: DECIDE chooses among candidate workflows using run history.
+
+    A candidate whose most recent execution on this goal completed without
+    moving the metric is excluded; the first remaining candidate in
+    declaration order runs; when no candidate remains, DECIDE parks a
+    decision_request instead of forcing a choice. ``decide()`` never
+    writes the Workflow definition — the definition travels with the
+    Decision and becomes durable at ACT, or when the owner adopts.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # A minimal inline two-workflow declaration through the same
+        # SPIELOS_TEST_DEPARTMENTS_DIR seam the fixtures use; the shipped
+        # fixtures are never modified.
+        import shutil
+
+        cls._departments = Path(tempfile.mkdtemp(prefix="spielos-history-lab-"))
+        package = cls._departments / "history_lab"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "department.py").write_text(HISTORY_LAB_DEPARTMENT)
+        os.environ["SPIELOS_TEST_DEPARTMENTS_DIR"] = str(cls._departments)
+        cls.addClassCleanup(shutil.rmtree, cls._departments, True)
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SPIELOS_TEST_DEPARTMENTS_DIR", None)
+
+    def setUp(self):
+        super().setUp()
+        self.new_goal(name="Twin metric", owner="history-lab",
+                      metric="twin_metric", target=1, aggregation="latest")
+        self.engine.resolution.executor = completing_executor(
+            payload={"twin_metric": 0})
+
+    def _decisions_by_sequence(self) -> dict[int, str | None]:
+        with self.runtime.connect() as connection:
+            rows = connection.execute(
+                """SELECT sequence,decision_json FROM core_runs
+                   WHERE goal_id=? ORDER BY sequence""",
+                (self.goal_id,)).fetchall()
+        return {row[0]: (json.loads(row[1]).get("kind")
+                         if row[1] else None) for row in rows}
+
+    def _workflow_decisions(self) -> dict[int, str]:
+        with self.runtime.connect() as connection:
+            rows = connection.execute(
+                """SELECT sequence,decision_json FROM core_runs
+                   WHERE goal_id=? AND decision_json IS NOT NULL
+                   ORDER BY sequence""", (self.goal_id,)).fetchall()
+        return {row[0]: json.loads(row[1]).get("workflow_id")
+                for row in rows if json.loads(row[1]).get("workflow_id")}
+
+    def _workflow_definitions(self) -> list[str]:
+        with self.runtime.connect() as connection:
+            return [row[0] for row in connection.execute(
+                "SELECT id FROM core_workflows ORDER BY id")]
+
+    def _drive_to_park_or_sequence(self, sequence: int) -> None:
+        from company.runtime.engine import GoalStage
+        for _ in range(60):
+            self.runtime.tick(max_advances=50)
+            run = self.current_run()
+            if (run.stage == GoalStage.DECIDE and run.status == "waiting"
+                    and run.decision is not None
+                    and run.decision.kind == "decision_request"):
+                return
+            if run.sequence >= sequence and run.stage == GoalStage.OBSERVE:
+                return
+
+    def test_flat_workflow_is_excluded_and_the_next_candidate_runs(self):
+        # F6 pin: workflow A's first execution leaves twin_metric at 0, so
+        # the next DECIDE excludes A and selects B in declaration order.
+        self._drive_to_park_or_sequence(2)
+        decisions = self._workflow_decisions()
+        self.assertEqual(decisions.get(1), "history-lab:alpha",
+                         "a fresh goal binds the first declared candidate")
+        self.assertEqual(decisions.get(2), "history-lab:beta",
+                         "after A left the metric flat, DECIDE selects B")
+
+    def test_when_every_candidate_is_excluded_decide_parks(self):
+        # F6 pin: after A and B both leave the metric flat, no candidate
+        # remains and DECIDE parks a decision_request instead of forcing
+        # a choice.
+        self._drive_to_park_or_sequence(3)
+        decisions = self._workflow_decisions()
+        self.assertEqual(sorted(decisions.values()),
+                         ["history-lab:alpha", "history-lab:beta"])
+        run = self.current_run()
+        self.assertEqual((run.stage, run.status), (GoalStage.DECIDE, "waiting"))
+        self.assertEqual(run.decision.kind, "decision_request")
+        attention = self.runtime.attention(goal_id=self.goal_id)
+        self.assertEqual(len(attention), 1, "one owner ask for the park")
+        request = (run.decision.context or {}).get("decision_request") or {}
+        offered = [f"{item['id']}:{workflow_id}"
+                   for item in request.get("candidates", {}).get("departments", [])
+                   for workflow_id in item.get("workflows", [])]
+        self.assertIn("history-lab:alpha", offered,
+                      "the owner may still choose an excluded candidate")
+
+    def test_decide_never_writes_the_workflow_definition(self):
+        # F6 pin: core_workflows stays empty through a department-owned
+        # DECIDE; the definition the Decision declared becomes durable
+        # only when the run reaches ACT (or the owner adopts).
+        self.runtime.once(self.goal_id)  # OBSERVE -> DECIDE
+        self.runtime.once(self.goal_id)  # DECIDE chose; the run moves to ACT
+        run = self.current_run()
+        self.assertEqual((run.stage, run.status), (GoalStage.ACT, "running"))
+        self.assertEqual(run.decision.kind, "execute_workflow")
+        self.assertEqual(run.decision.workflow_id, "history-lab:alpha")
+        self.assertEqual(self._workflow_definitions(), [],
+                         "DECIDE must not write to core_workflows")
+        self.runtime.once(self.goal_id)  # ACT persists the declaration
+        self.assertEqual(self._workflow_definitions(), ["history-lab:alpha"],
+                         "ACT persists the definition the Decision declared")
+
+    def test_a_parked_decide_adds_no_workflow_rows_until_adoption(self):
+        # F6 pin: through a parked decision_request the table never grows;
+        # `goal decide` adoption is what binds and writes next.
+        self._drive_to_park_or_sequence(3)
+        self.assertEqual(sorted(self._workflow_decisions().values()),
+                         ["history-lab:alpha", "history-lab:beta"])
+        definitions = self._workflow_definitions()
+        for _ in range(3):
+            self.runtime.tick(max_advances=30)  # the park is idempotent
+        self.assertEqual(self._workflow_definitions(), definitions,
+                         "a parked DECIDE writes no workflow definitions")
+        # Adoption binds the owner's chosen workflow and parks its work.
+        self.engine.resolution.executor = AssignmentExecutor()
+        self.runtime.decide_goal(self.goal_id, "execute_workflow",
+                                 workflow="history-lab:alpha")
+        run = self.current_run()
+        self.assertEqual((run.decision.kind, run.decision.workflow_id),
+                         ("execute_workflow", "history-lab:alpha"),
+                         "adoption binds the owner's chosen workflow")
+        orders = self.active_orders()
+        self.assertEqual([order["step_id"] for order in orders], ["a-one"],
+                         "the adopted workflow parks its first step")
+
+    def test_a_moved_workflow_is_not_excluded(self):
+        # F6 pin: exclusion compares the metric before and after the
+        # workflow run — a workflow that moved the metric stays a
+        # candidate and DECIDE re-selects it.
+        self.engine.resolution.executor = completing_executor(
+            payload={"twin_metric": 1})
+        self._drive_to_park_or_sequence(2)
+        self.assertEqual(self.runtime.goals.get(self.goal_id).status,
+                         "complete",
+                         "a workflow that moves the metric completes the goal")
+
+
+class _RecordingController:
+    """Controller double for the injectable-seam pins: decides bounded
+    direct work the default AssignmentExecutor parks for the host, and
+    records every GoalContext it is handed."""
+
+    def __init__(self, completes: bool = True):
+        self.completes = completes
+        self.contexts: list = []
+
+    def observe(self, context):
+        self.contexts.append(("observe", context))
+        return {context.goal.metric: 0}
+
+    def decide(self, context, observation):
+        self.contexts.append(("decide", context))
+        return Decision("request_agent", "produce the metric evidence", None,
+                        {"agent_id": "director",
+                         "evidence_kind": context.goal.metric})
+
+    def evaluate(self, context, decision, evidence):
+        self.contexts.append(("evaluate", context))
+        return Evaluation(self.completes and bool(evidence),
+                          {context.goal.metric: 1 if self.completes else 0},
+                          "bounded direct work completed")
+
+
+class TestInjectableSeams(HarnessCase):
+    """F6: the GoalController/AgentExecutor seams are injectable at
+    CleanCommandRuntime, with today's defaults when omitted."""
+
+    def test_a_custom_controller_drives_a_run_end_to_end(self):
+        controller = _RecordingController()
+        runtime = CleanCommandRuntime(self.db, controller=controller)
+        row = runtime.create_goal(
+            name="Seam goal", owner_id="director", metric="seam_metric",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        goal_id = row["id"]
+        runtime.tick(max_advances=10)
+        orders = runtime.work_orders(status="active", goal_id=goal_id)
+        self.assertEqual(len(orders), 1,
+                         "the injected controller's decision parks work")
+        runtime.complete_work_order(
+            orders[0]["id"], "director",
+            [{"kind": "seam_metric", "payload": {"seam_metric": 1}}])
+        runtime.tick(max_advances=10)
+        self.assertEqual(runtime.goals.get(goal_id).status, "complete",
+                         "the custom controller drives the run end to end")
+        self.assertTrue(any(stage == "evaluate" for stage, _ in
+                            controller.contexts),
+                        "the injected controller evaluated the run")
+        self.assertEqual(runtime.runtime.controller, controller,
+                         "the runtime uses the injected controller seam")
+
+    def test_a_custom_executor_is_injected_at_the_same_seam(self):
+        class _Parked:
+            def execute(self, agent, order):
+                return AgentResult(
+                    "ask_user", message=f"injected executor parked {order.id}")
+
+        executor = _Parked()
+        runtime = CleanCommandRuntime(self.db, executor=executor)
+        row = runtime.create_goal(
+            name="Executor seam goal", owner_id="director", metric="m",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        goal_id = row["id"]
+        runtime.tick(max_advances=10)
+        # A departmentless goal parks a decision_request first; answer it
+        # so the injected executor runs its order.
+        runtime.decide_goal(goal_id, "request_agent", agent="director",
+                            instruction="produce the metric evidence")
+        attention = runtime.attention(goal_id=goal_id)
+        self.assertTrue(any("injected executor parked" in item.get("message", "")
+                            for item in attention),
+                        "the injected executor executed the work order")
+        self.assertEqual(runtime.runtime.resolution.executor, executor,
+                         "the runtime uses the injected executor seam")
+
+    def test_the_default_seams_are_unchanged_when_omitted(self):
+        runtime = CleanCommandRuntime(self.db)
+        self.assertIsInstance(runtime.runtime.controller, CatalogController)
+        self.assertIsInstance(runtime.runtime.resolution.executor,
+                              AssignmentExecutor)
+
+    def test_context_carries_children_blockers_and_decisions(self):
+        controller = _RecordingController(completes=False)
+        runtime = CleanCommandRuntime(self.db, controller=controller)
+        row = runtime.create_goal(
+            name="Focus goal", owner_id="director", metric="focus_metric",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        goal_id = row["id"]
+        runtime.create_goal(
+            name="Child goal", owner_id="director", metric="child_metric",
+            operator="ge", target=1, parent_id=goal_id,
+            config={"aggregation": "latest"})
+        paused = runtime.create_goal(
+            name="Paused child", owner_id="director", metric="paused_metric",
+            operator="ge", target=1, parent_id=goal_id,
+            config={"aggregation": "latest"})
+        runtime.goals.set_status(paused["id"], "paused")
+        blocker = runtime.create_goal(
+            name="Blocking goal", owner_id="director", metric="block_metric",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        runtime.goals.add_block(blocker["id"], goal_id)
+        # A blocked goal is never scheduled, so drive its loop directly:
+        # two full cycles (DECIDE -> ACT parks the order -> the host
+        # completes it -> EVALUATE chains) build the run history the next
+        # DECIDE context must carry.
+        runtime.runtime.resolution.executor = completing_executor(
+            payload={"focus_metric": 0})
+        for _ in range(2):
+            runtime.once(goal_id)  # OBSERVE -> DECIDE
+            runtime.once(goal_id)  # DECIDE -> ACT parks the direct order
+            for order in runtime.work_orders(status="active", goal_id=goal_id):
+                runtime.complete_work_order(
+                    order["id"], "director",
+                    [{"kind": "focus_metric",
+                      "payload": {"focus_metric": 0}}])
+            runtime.once(goal_id)  # EVALUATE -> chains the next run
+        runtime.once(goal_id)  # the next run reaches DECIDE
+        decide_contexts = [context for stage, context in controller.contexts
+                           if stage == "decide" and context.goal.id == goal_id]
+        self.assertTrue(decide_contexts, "DECIDE ran with the injected seam")
+        context = decide_contexts[-1]
+        self.assertEqual([item.name for item in context.children],
+                         ["Child goal"],
+                         "only the active children are carried")
+        self.assertEqual([item.name for item in context.blockers],
+                         ["Blocking goal"],
+                         "the incomplete blockers are carried")
+        decisions = context.decisions
+        self.assertTrue(decisions, "the decision history is carried")
+        self.assertEqual([item["sequence"] for item in decisions],
+                         sorted((item["sequence"] for item in decisions),
+                                reverse=True),
+                         "the decision history is most recent first")
+        self.assertEqual(decisions[0]["kind"], "request_agent")
+        self.assertEqual(decisions[0]["resolution_outcome"],
+                         "RETURN_TO_GOAL",
+                         "each entry carries the run's resolution outcome")
+        self.assertEqual(decisions[-1]["sequence"], 1)
+        self.assertLessEqual(len(decisions), 3,
+                             "at most the last 3 decided runs are carried")
+
+
+# =========================================================================
+# 9b. RUNTIME CORRECTNESS: per-goal failure isolation + single-owner
+#     Run claims (audit F1 + F2)
+# =========================================================================
+
+class _DirectWorkController:
+    """Controller double: always decides bounded direct work the scripted
+    executor can complete, so DECIDE→ACT→EVALUATE all run without a
+    Department or fixture dependency."""
+
+    def observe(self, context):
+        return {context.goal.metric: 0}
+
+    def decide(self, context, observation):
+        return Decision("request_agent", "produce the metric evidence", None,
+                        {"agent_id": "director", "evidence_kind": "m"})
+
+    def evaluate(self, context, decision, evidence):
+        return Evaluation(False, {context.goal.metric: 0},
+                          "clean-core evidence evaluated")
+
+
+class TestPerGoalFailureIsolation(HarnessCase):
+    """F1: one broken goal cannot starve the scheduler."""
+
+    def setUp(self):
+        super().setUp()
+        self.goal_a = self.new_goal(name="Broken goal", metric="m_a")
+        self.goal_b = self.other_goal(name="Healthy goal B", metric="m_b")
+        self.goal_c = self.other_goal(name="Healthy goal C", metric="m_c")
+
+    def test_one_raising_goal_parks_while_siblings_advance(self):
+        # A controller/Department that raises inside one goal's DECIDE must
+        # park that goal (runtime_failure evidence + one owner ask, run
+        # waiting) while the sibling goals in the same tick still advance.
+        broken = self.goal_a["id"]
+
+        class _FailingForGoal:
+            """Wraps the real controller; raises for goal A's DECIDE only."""
+
+            def __init__(self, inner):
+                self.inner = inner
+
+            def observe(self, context):
+                return self.inner.observe(context)
+
+            def decide(self, context, observation):
+                if context.goal.id == broken:
+                    raise RuntimeError(
+                        "department catalog exploded for this goal")
+                return self.inner.decide(context, observation)
+
+            def evaluate(self, context, decision, evidence):
+                return self.inner.evaluate(context, decision, evidence)
+
+        original = self.engine.controller
+        self.engine.controller = _FailingForGoal(original)
+        try:
+            result = self.engine.tick(max_advances=10)
+        finally:
+            self.engine.controller = original
+
+        # The tick itself stays coherent instead of raising.
+        self.assertIsInstance(result, dict)
+        self.assertIn("advanced", result)
+        self.assertIn("quiescent", result)
+
+        # The broken goal parked: run waiting, durable runtime_failure
+        # evidence, exactly one pending owner ask.
+        run_a = self.runtime.runs.current(broken)
+        self.assertEqual(run_a.status, "waiting",
+                         "a raising goal must park its run at waiting")
+        with self.runtime.connect() as connection:
+            failures = connection.execute(
+                "SELECT COUNT(*) FROM core_evidence WHERE run_id=? "
+                "AND kind='runtime_failure'", (run_a.id,)).fetchone()[0]
+            asks = connection.execute(
+                "SELECT COUNT(*) FROM core_notifications WHERE goal_id=? "
+                "AND kind='owner_input_required' AND status='pending'",
+                (broken,)).fetchone()[0]
+        self.assertEqual(failures, 1,
+                         "the failure must be recorded exactly once as "
+                         "runtime_failure evidence")
+        self.assertEqual(asks, 1,
+                         "exactly one owner ask per failing run")
+        self.assertNotIn(run_a.id,
+                          [r.id for r in self.runtime.runs.ready()],
+                          "a parked failing run must stop being scheduled")
+
+        # The sibling goals still advanced: each left OBSERVE.
+        for healthy in (self.goal_b, self.goal_c):
+            run = self.runtime.runs.current(healthy["id"])
+            self.assertNotEqual(run.stage, GoalStage.OBSERVE,
+                                f"{healthy['name']} must still advance")
+        # The failing goal's DECIDE never produced a decision: it parked
+        # at the stage whose seam raised.
+        self.assertEqual(run_a.stage, GoalStage.DECIDE)
+        self.assertIsNone(run_a.decision,
+                          "a raising DECIDE must not persist a decision")
+
+
+class TestSingleOwnerRunClaims(unittest.TestCase):
+    """F2: two workers over one database cannot double-advance a Run.
+
+    Every stage/status transition is a compare-and-swap: the worker whose
+    guarded UPDATE matches no row (because the other worker moved the
+    run first) returns the current state idempotently — no raise, no
+    duplicated Intervention, WorkflowRun, WorkOrder, or decision row.
+    """
+
+    def setUp(self):
+        self.db = temp_db()
+        # Two independent runtimes (two workers) over the same database
+        # file, same controller/executor types.
+        self.runtime1 = CleanCommandRuntime(self.db)
+        self.runtime2 = CleanCommandRuntime(self.db)
+        self.engine1 = self.runtime1.runtime
+        self.engine2 = self.runtime2.runtime
+        for engine in (self.engine1, self.engine2):
+            engine.controller = _DirectWorkController()
+            engine.resolution.executor = completing_executor(
+                payload={"m": 1})
+        row = self.runtime1.create_goal(
+            name="Contested goal", owner_id="director", metric="m",
+            operator="ge", target=1,
+            config={"aggregation": "latest"})
+        self.goal_id = row["id"]
+
+    def tearDown(self):
+        self.db.unlink(missing_ok=True)
+
+    def _counts(self):
+        """Row invariants that must never grow when a CAS loses."""
+        with self.runtime1.connect() as connection:
+            runs = connection.execute(
+                "SELECT COUNT(*) FROM core_runs WHERE goal_id=?",
+                (self.goal_id,)).fetchone()[0]
+            interventions = connection.execute(
+                "SELECT COUNT(*) FROM core_interventions WHERE goal_id=?",
+                (self.goal_id,)).fetchone()[0]
+            workflow_runs = connection.execute(
+                "SELECT COUNT(*) FROM core_workflow_runs WHERE goal_id=?",
+                (self.goal_id,)).fetchone()[0]
+            work_orders = connection.execute(
+                "SELECT COUNT(*) FROM core_work_orders WHERE goal_id=?",
+                (self.goal_id,)).fetchone()[0]
+        return {"runs": runs, "interventions": interventions,
+                "workflow_runs": workflow_runs, "work_orders": work_orders}
+
+    def _decision_row(self):
+        with self.runtime1.connect() as connection:
+            return connection.execute(
+                "SELECT decision_json FROM core_runs WHERE id=?",
+                (self.runtime1.runs.current(self.goal_id).id,)).fetchone()[0]
+
+    def test_cas_lost_advance_returns_current_status_without_raising(self):
+        # Worker 2 holds the DECIDE claim; while it is mid-decide, worker
+        # 1 steals the DECIDE→ACT transition underneath it. Worker 2's
+        # compare-and-swap matches no row: it must return the current
+        # status idempotently — no raise, no second decision, no rows.
+        self.engine1.advance(self.goal_id)  # OBSERVE→DECIDE
+        self.assertEqual(self.engine1.runs.current(self.goal_id).stage,
+                         GoalStage.DECIDE)
+        stolen = {}
+
+        class _RacingDecide(_DirectWorkController):
+            """Worker 2's decide seam: worker 1 steals the transition."""
+
+            def __init__(self, engine):
+                self.engine = engine
+
+            def decide(self, context, observation):
+                stolen["state"] = self.engine.advance(context.goal.id)
+                return Decision("request_agent", "worker 2 lost the race",
+                                None, {"agent_id": "director",
+                                       "evidence_kind": "m"})
+
+        self.engine2.controller = _RacingDecide(self.engine1)
+        try:
+            loser = self.engine2.advance(self.goal_id)
+        finally:
+            self.engine2.controller = _DirectWorkController()
+
+        # No raise; the loser sees the current (re-read) state.
+        self.assertEqual(loser["run"].stage, GoalStage.ACT)
+        self.assertEqual(loser["run"].status, "running")
+        self.assertEqual(loser["run"].sequence, 1)
+        # The winner's decision is the only persisted one — the loser's
+        # racing decision never overwrote it.
+        self.assertIn("produce the metric evidence", self._decision_row())
+        self.assertNotIn("worker 2 lost the race", self._decision_row())
+        self.assertEqual(self._counts(),
+                         {"runs": 1, "interventions": 0,
+                          "workflow_runs": 0, "work_orders": 0})
+
+    def test_alternating_workers_never_duplicate_run_rows(self):
+        # Drive both workers alternately through the whole loop; at every
+        # step the structural invariants hold: at most one Intervention
+        # per run-stage transition, exactly the expected WorkflowRun and
+        # WorkOrder rows, and one stage boundary per advance.
+        before = self.engine1.runs.current(self.goal_id)
+        self.assertEqual((before.stage, before.status),
+                         (GoalStage.OBSERVE, "ready"))
+        # OBSERVE→DECIDE on worker 1, then a quick double-advance on the
+        # same instance: the second call sees the CAS-guarded state.
+        self.engine1.advance(self.goal_id)
+        self.engine1.advance(self.goal_id)  # DECIDE→ACT (fresh claim)
+        run = self.engine1.runs.current(self.goal_id)
+        self.assertEqual((run.stage, run.status), (GoalStage.ACT, "running"))
+        self.assertEqual(self._counts()["interventions"], 0)
+
+        # ACT on worker 2: the one Intervention is created, the executor
+        # completes the direct order, the run reaches EVALUATE.
+        state = self.engine2.advance(self.goal_id)
+        self.assertEqual(state["run"].stage, GoalStage.EVALUATE)
+        with self.runtime2.connect() as connection:
+            interventions = connection.execute(
+                "SELECT COUNT(*) FROM core_interventions WHERE run_id=?",
+                (state["run"].id,)).fetchone()[0]
+        self.assertLessEqual(interventions, 1,
+                             "never two Interventions for one run-stage "
+                             "transition")
+        self.assertEqual(self._counts(),
+                         {"runs": 1, "interventions": 1,
+                          "workflow_runs": 0, "work_orders": 1})
+
+        # EVALUATE on worker 1: the run completes and chains exactly one
+        # follow-on run.
+        self.engine1.advance(self.goal_id)
+        counts = self._counts()
+        self.assertEqual(counts["runs"], 2,
+                         "the completed run chains exactly one follow-on run")
+        self.assertEqual(counts["interventions"], 1)
+        current = self.engine1.runs.current(self.goal_id)
+        self.assertEqual((current.stage, current.sequence),
+                         (GoalStage.OBSERVE, 2))
+
+    def test_parked_act_readvanced_by_both_workers_duplicates_nothing(self):
+        # The AssignmentExecutor parks ACT for the host (ask_user); both
+        # workers then re-advance the parked run. The idempotent CAS plus
+        # the intervention-keyed notification conflict keep every row
+        # singular: no duplicate orders, asks, or interventions.
+        for engine in (self.engine1, self.engine2):
+            engine.resolution.executor = AssignmentExecutor()
+        self.engine1.advance(self.goal_id)  # OBSERVE→DECIDE
+        self.engine1.advance(self.goal_id)  # DECIDE→ACT
+        parked = self.engine1.advance(self.goal_id)  # ACT parks ask_user
+        self.assertEqual((parked["run"].stage, parked["run"].status),
+                         (GoalStage.ACT, "waiting"))
+        self.assertEqual(self._counts(),
+                         {"runs": 1, "interventions": 1,
+                          "workflow_runs": 0, "work_orders": 1})
+        with self.runtime1.connect() as connection:
+            asks = connection.execute(
+                """SELECT COUNT(*) FROM core_notifications
+                   WHERE goal_id=? AND kind='owner_input_required'
+                     AND status='pending'""", (self.goal_id,)).fetchone()[0]
+        self.assertEqual(asks, 1, "exactly one owner ask for the parked run")
+
+        # Both workers re-advance the parked run: idempotent, no growth.
+        self.engine2.advance(self.goal_id)
+        self.engine1.advance(self.goal_id)
+        self.assertEqual(self._counts(),
+                         {"runs": 1, "interventions": 1,
+                          "workflow_runs": 0, "work_orders": 1},
+                         "re-advancing a parked run duplicates nothing")
+        with self.runtime2.connect() as connection:
+            asks = connection.execute(
+                """SELECT COUNT(*) FROM core_notifications
+                   WHERE goal_id=? AND kind='owner_input_required'
+                     AND status='pending'""", (self.goal_id,)).fetchone()[0]
+        self.assertEqual(asks, 1, "the parked ask stays singular")
+
 
 
 # =========================================================================
@@ -1149,6 +2157,25 @@ class TestGoalTopologyAndScheduling(HarnessCase):
         defect = next(d for d in audit["defects"]
                       if d["kind"] == "missing_parent")
         self.assertEqual(defect["parent_id"], "goal-missing-parent")
+
+    def test_multiple_independent_root_goals_are_not_a_defect(self):
+        # F9(b) pin: a healthy home with several independent root goals
+        # reports its root ids with NO disconnected_non_primary_root
+        # defect — only a single-root home names a canonical root.
+        first = self.new_goal(name="First root")
+        second = self.new_goal(name="Second root")
+        third = self.runtime.create_goal(
+            name="Child of second", owner_id="director", metric="m",
+            operator="ge", target=1, parent_id=second["id"],
+            config={"aggregation": "latest"})
+        audit = self.runtime.topology_audit()
+        self.assertEqual(sorted(audit["root_goal_ids"]),
+                         sorted([first["id"], second["id"]]),
+                         "the independent root ids are reported")
+        self.assertEqual(audit["defects"], [],
+                         "independent roots are not a topology defect")
+        self.assertIsNone(audit["canonical_root_goal_id"],
+                          "a multi-root home names no canonical root")
 
     def test_cycle_edges_rejected(self):
         a = self.new_goal(name="A")
@@ -1344,7 +2371,13 @@ class TestCLISurface(unittest.TestCase):
 
     def test_tasks_complete_by_agent_id_documented_flow_succeeds(self):
         # D1 fixed (inverted pin): the documented host flow completes an
-        # order the runtime claimed, using the agent id, first try.
+        # order the runtime claimed, using the agent id, first try. The
+        # DECIDE boundary parks a decision_request first, so the flow goes
+        # through `goal decide` before the order exists.
+        goal_id = self.run_cli("goal", "list", "--json")[0]["id"]
+        self.run_cli("goal", "decide", goal_id, "--kind", "request_agent",
+                     "--agent", "director",
+                     "--instruction", "produce the metric evidence")
         orders = self.run_cli("tasks", "--json")
         order_id, agent_id = orders[0]["id"], orders[0]["agent_id"]
         result = self.run_cli("tasks", order_id, "--complete", agent_id,
@@ -1365,11 +2398,17 @@ class TestCLISurface(unittest.TestCase):
     def test_tasks_complete_learning_flag_writes_workflow_memory(self):
         # D2 fixed, through the real CLI: --learning persists workflow
         # memory grounded in the evidence just recorded. Uses its own goal
-        # so other CLI tests' completed orders do not consume the park.
+        # so other CLI tests' completed orders do not consume the park. The
+        # DECIDE boundary is answered with `goal decide` first.
         self.run_cli("goal", "create", "--name", "Learning goal",
                      "--owner", "director", "--metric", "m",
                      "--target", "1")
         self.run_cli("runner", "tick", "--json")
+        goals = [goal for goal in self.run_cli("goal", "list", "--json")
+                 if goal["name"] == "Learning goal"]
+        self.run_cli("goal", "decide", goals[0]["id"], "--kind", "request_agent",
+                     "--agent", "director",
+                     "--instruction", "produce learning evidence")
         orders = [o for o in self.run_cli("tasks", "--json")
                   if o["goal_id"] != "CLI goal" or o["status"] in ("open", "claimed")]
         orders = [o for o in orders if o["agent_id"] == "director"]

@@ -1,0 +1,13 @@
+{
+  "id": "system-improvement",
+  "description": "Executes approved bounded runtime/Department improvements with acceptance tests and version evidence",
+  "produces": [
+    "engine_safety",
+    "legacy_purge",
+    "executor_identity",
+    "decide_stall",
+    "memory_context_hygiene",
+    "learning_loop",
+    "acceptance_green"
+  ]
+}

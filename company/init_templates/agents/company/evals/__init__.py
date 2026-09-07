@@ -8,7 +8,7 @@ campaign can advance.
 Public surface:
 
 - models: EvalCriterion, EvalSuite, EvalVerdict, EvalReport
-- judge:  AgentJudgeConnector (honest default), HttpJudgeConnector (stub seam)
+- judge:  AgentJudgeConnector (honest default), JudgeConnector (protocol)
 - engine: run_suite, render_request, validate_verdicts, compute_report
 - registry: register_suite, discover_suites, suites, get_suite
 - serialization: suite_spec, report_to_evidence
@@ -20,7 +20,7 @@ from .engine import (
     run_suite,
     validate_verdicts,
 )
-from .judge import AgentJudgeConnector, HttpJudgeConnector, JudgeConnector
+from .judge import AgentJudgeConnector, JudgeConnector
 from .models import (
     EvalCriterion,
     EvalReport,
@@ -37,7 +37,6 @@ __all__ = [
     "EvalReport",
     "EvalSuite",
     "EvalVerdict",
-    "HttpJudgeConnector",
     "JudgeConnector",
     "compute_report",
     "discover_suites",

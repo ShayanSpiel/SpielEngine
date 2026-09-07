@@ -106,6 +106,31 @@ class ContextProjectionTests(unittest.TestCase):
                 'Profile: preferences.timezone={"zone": "Europe/Berlin"}',
                 projection["context"])
 
+    def test_readonly_projection_focus_follows_ready_priority(self):
+        """F8: the host hook reads the projection read-only; its focus
+        still follows the scheduler's ready() priority order, not
+        creation order."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = _make_home(directory)
+            command = self._runtime(home)
+            command.runtime.create_goal(
+                "Low priority goal", "outcome", "ge", 1, owner_id="director",
+                config={"priority": "low", "aggregation": "latest"})
+            critical = command.runtime.create_goal(
+                "Critical goal", "outcome", "ge", 1, owner_id="director",
+                config={"priority": "critical", "aggregation": "latest"})
+            database = home / ".spielos" / "state" / "company.sqlite"
+            before = database.read_bytes()
+            projection = CleanCommandRuntime(
+                database, readonly=True).assemble_context(
+                prompt="what is next", owner_id="director")
+            self.assertEqual(projection["goal_id"], critical.id,
+                             "the ready() priority order decides the focus")
+            self.assertIn("Goal: Critical goal", projection["context"])
+            self.assertEqual(database.read_bytes(), before,
+                             "the read-only projection must not mutate the "
+                             "database file")
+
 
 if __name__ == "__main__":
     unittest.main()

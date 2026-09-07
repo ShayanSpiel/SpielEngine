@@ -19,8 +19,9 @@ class RunnerService:
         # matching how the runner derives its state directory
         # (automation_enabled(store.path.parent)). Deriving from the db path
         # keeps `company runner stop` effective for a custom --db too: the
-        # flag is written and read at the same location. For the default db
-        # (.spielos/state/company.sqlite) this is the historical layout.
+        # flag is written and read at the same location, so for the default
+        # db (.spielos/state/company.sqlite) the control files live in the
+        # private state tree.
         self.state_dir = self.db_path.parent
         self.pid_path = self.state_dir / "runner.pid"
         self.log_path = self.state_dir / "runner.log"

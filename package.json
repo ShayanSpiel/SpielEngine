@@ -1,6 +1,6 @@
 {
   "name": "spielos",
-  "version": "10.2.1",
+  "version": "10.3.0",
   "description": "SpielOS: a clean durable Goal runtime with declarative Departments, evidence, and approvals.",
   "bin": {
     "spielos": "bin/spielos.js"

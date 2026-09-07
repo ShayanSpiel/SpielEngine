@@ -40,6 +40,59 @@ Operate the one GoalRuntime loop:
 3. Resolve it through a declared Workflow and Agent work orders.
 4. Evaluate the evidence and either complete the Goal or create its next Run.
 
+## Goal lineage (never break)
+
+Every substantive owner request becomes or attaches to a Goal before any
+work executes — never run meaningful work outside the Goal -> Run ->
+Intervention -> WorkOrder -> Evidence lineage. When a request is trivial
+conversation (status, memory, or a question), say so and answer it directly
+instead of manufacturing a Goal for it.
+
+## Owner asks (the DECIDE boundary, stalls, and reviews)
+
+- When a Goal parks a `decision_request`, present the ask to the owner in
+  its structured form — what is needed, why now, what decision is required,
+  what happens after — and record the answer with
+  `company goal decide <goal_id> --kind execute_workflow --workflow
+  <department_id>:<workflow_id>` or `--kind request_agent --agent <id>
+  --instruction "<bounded instruction>" --evidence-kind <kind>`. Direct work
+  needs a concrete instruction; never answer with content-free work.
+- When a Goal parks for a stall (its metric held flat with no new
+  evidence) or a review checkpoint, present continue/adjust/pause and
+  record the answer with `company goal resume <goal_id>` (continue) or a
+  Goal change (adjust), or leave it parked (hold).
+
+## Memory posture
+
+Memory has one precise taxonomy — never a loose "post what it taught":
+
+- **Owner preference, constraint, or authority** (how the owner wants
+  things run) goes to `profile set` — owner-scope memory, no evidence
+  needed.
+- **Owner strategic direction stated during tasks** (ICP change, segment
+  pivot, offer change) goes to `memory add --scope strategy --claim
+  "..." --evidence <id> --goal <id> --run <id>` with the task's evidence
+  ids, goal, and run lineage.
+- **Operational lessons** (how this kind of work should run next time) go
+  to `tasks <id> --complete <agent> --evidence '[...]' --learning
+  "<claim>"` — workflow scope, and only when something genuinely
+  reusable was learned. Never announce memory when nothing was learned;
+  never invent a lesson.
+
+Agents honor the `memory` claims carried in WorkOrder briefs (the
+`Workflow learning` / `Relevant memory` lines) — build on them instead
+of re-deriving. Strategy learning is captured at evaluation boundaries
+only when the evidence genuinely changes a future Goal-level choice;
+completing work writes no strategy memory by itself. Workflow revisions
+are proposed through adoption with reason and evidence, never silently
+rewritten; retire stale claims with `memory retire <memory_id>`.
+
+## Ask structure
+
+Every owner ask states WHAT is needed, WHY now, WHAT decision is required,
+and WHAT happens after the owner answers — the same shape every parked
+notification carries.
+
 Run `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.agents python3 -B -m company ...`
 commands directly. Never add pipes, redirects, separators, `head`, `tail`, or
 other shell processing to an allowed runtime command.
@@ -48,9 +101,9 @@ Use the clean command surface only:
 
 ```text
 status            overview          context           observe catalog
-departments       layout            goal create|list|topology|show
+departments       layout            goal create|list|topology|show|decide|resume
 evidence add       approve           tasks             runner tick|watch|start|stop|status|enable
-memory summary|owner|workflows|strategy
+memory summary|owner|workflows|strategy|retire
 profile list|set  notifications list|ack
 ```
 

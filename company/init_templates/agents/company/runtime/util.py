@@ -12,8 +12,13 @@ _COMPARE_OPERATORS = {
 
 
 def compare(value, operator: str, target) -> bool:
-    """Evaluate one metric against its target. Unknown operator -> False."""
+    """Evaluate one metric against its target.
+
+    Unknown operators raise ValueError instead of silently failing
+    closed: the CLI validates operators at goal creation, so an unknown
+    operator reaching here is a defect to surface, not a comparison.
+    """
     operation = _COMPARE_OPERATORS.get(operator)
     if operation is None:
-        return False
+        raise ValueError(f"unknown comparison operator: {operator!r}")
     return operation(value, target)

@@ -110,5 +110,32 @@ class Observer:
             memory = {row[0]: row[1] for row in connection.execute("""
                 SELECT scope, COUNT(*) FROM core_memory
                 WHERE status='active' GROUP BY scope""")}
+            # L3 repetition signal: the same bounded direct work executed
+            # over and over is the strongest hint the work merits a
+            # reusable Workflow. Three or more completed direct orders on
+            # one goal, by the same agent, with the same instruction,
+            # surface as one bounded entry (newest shapes first, at most
+            # five). Read-only projection — no clustering, no embeddings.
+            shapes: dict[tuple[str, str, str], int] = {}
+            for row in connection.execute("""SELECT goal_id, agent_id, brief_json
+                FROM core_work_orders
+                WHERE step_id='direct' AND status='completed'"""):
+                instruction = " ".join(
+                    (json.loads(row["brief_json"]).get("instruction")
+                     or "").split())
+                if not instruction:
+                    continue
+                shape = (row["goal_id"], row["agent_id"], instruction)
+                shapes[shape] = shapes.get(shape, 0) + 1
+            repetition = [
+                {"goal_id": goal_id, "agent_id": agent_id,
+                 "completed_orders": count, "instruction": instruction,
+                 "suggestion": "three similar direct WorkOrders — this work "
+                               "may merit a reusable Workflow proposed "
+                               "through adoption"}
+                for (goal_id, agent_id, instruction), count
+                in sorted(shapes.items(), key=lambda item: (-item[1], item[0]))
+                if count >= 3][:5]
         return {"health": self.health(), "goals": goals,
-                "attention": attention, "memory": memory}
+                "attention": attention, "memory": memory,
+                "repetition": repetition}

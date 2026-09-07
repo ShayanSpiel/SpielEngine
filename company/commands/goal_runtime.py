@@ -7,33 +7,44 @@ import shutil
 import sqlite3
 import tempfile
 import time
-import weakref
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..agents.core import AgentResult
 from ..agents.loader import available_agents
+from ..evidence import EvidenceRepository
 from ..goals import GoalRepository
 from ..layout import layout_summary
+from ..memory import MemoryRepository
 from ..resolution.core import ApprovalRepository
 from ..state import Database
 from ..observability import Observer
-from ..work_orders import WorkOrderRepository, executor_identity
+from ..work_orders import WorkOrderRepository
 from ..workflows import Workflow, WorkflowRepository, WorkflowStep
-from ..runtime.engine import Decision, Evaluation, GoalRuntime
+from ..runtime.engine import Decision, Evaluation, GoalRuntime, GoalStage
 from ..runtime.registry import departments
 from ..runtime.util import compare
+
+
+def _declared_metrics(handler) -> set[str]:
+    """Metrics a Department declares (the D3 rule, shared by goal creation
+    and DECIDE candidate filtering)."""
+    declared = set(getattr(handler, "evidence_metrics", {}) or ())
+    schema = getattr(handler, "goal_schema", None) or {}
+    declared.update(schema.get("metrics") or ())
+    return declared
 
 
 class CatalogController:
     """Translate portable Department declarations into clean Workflows."""
 
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, agents: dict | None = None):
         self.database = database
         self.goals = GoalRepository(database)
         self.workflows = WorkflowRepository(database)
         self.departments = departments()
+        self.agents = dict(agents or {})
 
     def observe(self, context) -> dict:
         goal = context.goal
@@ -82,26 +93,181 @@ class CatalogController:
             return Decision("evaluate", "Goal evidence meets its target",
                             context={"result_ready": True})
         handler = self.departments.get(goal.owner_id)
-        if handler is None:
-            return Decision("request_agent", f"{goal.owner_id} must choose bounded work",
-                            context={"agent_id": goal.owner_id,
-                                     "evidence_kind": goal.metric})
         requested = (goal.config or {}).get("workflow")
-        workflow = next((item for item in handler.workflows
-                         if item.id == requested), None)
-        if workflow is None:
-            workflow = handler.workflows[0] if handler.workflows else None
-        if workflow is None:
-            return Decision("request_agent", f"{goal.owner_id} must produce {goal.metric}",
-                            context={"agent_id": goal.owner_id,
-                                     "evidence_kind": goal.metric})
-        if not isinstance(workflow, Workflow):
-            raise TypeError("Department workflows must use company.workflows.Workflow")
+        candidates = tuple(handler.workflows) if handler is not None else ()
+        chosen = None
+        if requested:
+            chosen = next((item for item in candidates
+                           if item.id == requested), None)
+        if chosen is None:
+            remaining = candidates
+            if len(candidates) > 1 and self._has_run_history(goal):
+                # F6: decide from history — a candidate whose most recent
+                # execution on this goal completed without moving the
+                # metric is excluded; the first remaining candidate in
+                # declaration order runs.
+                remaining = tuple(item for item in candidates
+                                  if not self._excluded_by_history(goal, item))
+            chosen = remaining[0] if remaining else None
+        if handler is not None and chosen is not None:
+            if not isinstance(chosen, Workflow):
+                raise TypeError("Department workflows must use company.workflows.Workflow")
+            workflow_id = f"{goal.owner_id}:{chosen.id}"
+            # DECIDE never writes: the chosen definition travels with the
+            # Decision and becomes durable when the run reaches ACT (the
+            # engine persists it exactly like the Intervention) or when
+            # `goal decide` adopts it for the owner.
+            return Decision("execute_workflow", chosen.name, workflow_id, context={
+                "workflow": {"id": workflow_id, "name": chosen.name,
+                             "steps": [asdict(step) for step in chosen.steps],
+                             "department_id": goal.owner_id,
+                             "version": chosen.version}})
+        # DECIDE intelligence boundary: no Department can decide this goal's
+        # next bounded step, so the owner decides. Never invent content-free
+        # bounded work; park a structured decision_request instead.
+        request = self.decision_request(context, observation)
+        return Decision("decision_request", request["message"], context={
+            "decision_request": request, "agent_id": None, "evidence_kind": None})
+
+    def _has_run_history(self, goal) -> bool:
+        """True when this goal has at least one earlier run (F6): DECIDE
+        has run history to decide from. Pure read."""
+        with self.database.connect() as connection:
+            return bool(connection.execute(
+                """SELECT 1 FROM core_runs WHERE goal_id=? AND sequence>1
+                   LIMIT 1""", (goal.id,)).fetchone())
+
+    def _excluded_by_history(self, goal, workflow) -> bool:
+        """F6: True when this workflow's most recent execution on THIS goal
+        completed without moving the metric — run history says repeating
+        it cannot help. Pure SQL over core_workflow_runs joined with the
+        interventions and runs that executed it.
+
+        The metric before is the evaluation of the run preceding that
+        workflow run (falling back to the executing run's own OBSERVE —
+        the value the workflow started from); the metric after is the
+        executing run's evaluation (falling back to its observation when
+        not yet evaluated).
+        """
         workflow_id = f"{goal.owner_id}:{workflow.id}"
-        self.workflows.save(Workflow(
-            workflow_id, workflow.name, workflow.steps, goal.owner_id,
-            workflow.version))
-        return Decision("execute_workflow", workflow.name, workflow_id)
+        with self.database.connect() as connection:
+            execution = connection.execute("""SELECT wr.status,wr.run_id,r.sequence
+                FROM core_workflow_runs wr
+                JOIN core_interventions i ON i.id=wr.intervention_id
+                JOIN core_runs r ON r.id=wr.run_id
+                WHERE wr.workflow_id=? AND wr.goal_id=?
+                ORDER BY r.sequence DESC,wr.created_at DESC LIMIT 1""",
+                (workflow_id, goal.id)).fetchone()
+            if execution is None or execution["status"] != "complete":
+                return False
+
+            def evaluation_metric(run_row) -> object:
+                if run_row is None or not run_row["evaluation_json"]:
+                    return None
+                try:
+                    evaluation = json.loads(run_row["evaluation_json"])
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                return (evaluation.get("metrics") or {}).get(goal.metric)
+
+            def observation_metric(run_row) -> object:
+                if run_row is None or not run_row["observation_json"]:
+                    return None
+                try:
+                    observation = json.loads(run_row["observation_json"])
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                return observation.get(goal.metric)
+
+            executing = connection.execute(
+                """SELECT evaluation_json,observation_json FROM core_runs
+                   WHERE id=?""", (execution["run_id"],)).fetchone()
+            preceding = connection.execute(
+                """SELECT evaluation_json FROM core_runs
+                   WHERE goal_id=? AND sequence<? AND evaluation_json IS NOT NULL
+                   ORDER BY sequence DESC LIMIT 1""",
+                (goal.id, execution["sequence"])).fetchone()
+            before = evaluation_metric(preceding)
+            if before is None:
+                before = observation_metric(executing)
+            after = evaluation_metric(executing)
+            if after is None:
+                after = observation_metric(executing)
+        return before is not None and after is not None and before == after
+
+    def decision_request(self, context, observation: dict) -> dict:
+        """The owner-facing ask a parked DECIDE renders: goal state, the
+        evidence behind it, candidate Departments/workflows/agents, and the
+        exact answer syntax. Pure reads — deterministic candidate filtering
+        only, never a choice."""
+        goal = context.goal
+        with self.database.connect() as connection:
+            children = [{"id": row["id"], "name": row["name"],
+                         "status": row["status"]}
+                        for row in connection.execute(
+                            """SELECT g.id,g.name,g.status FROM core_goals g
+                               WHERE g.parent_id=? ORDER BY g.created_at""",
+                            (goal.id,))]
+            blockers = [{"id": row["id"], "name": row["name"],
+                         "status": row["status"]}
+                        for row in connection.execute(
+                            """SELECT g.id,g.name,g.status FROM core_goal_edges e
+                               JOIN core_goals g ON g.id=e.source_goal_id
+                               WHERE e.target_goal_id=? AND e.relation='blocks'
+                                 AND g.status!='complete'""",
+                            (goal.id,))]
+            recent_runs = []
+            for row in connection.execute(
+                    """SELECT sequence,stage,status,evaluation_json FROM core_runs
+                       WHERE goal_id=? ORDER BY sequence DESC LIMIT 5""",
+                    (goal.id,)):
+                summary = None
+                if row["evaluation_json"]:
+                    summary = (json.loads(row["evaluation_json"]) or {}).get("summary")
+                recent_runs.append({"sequence": row["sequence"],
+                                    "stage": row["stage"], "status": row["status"],
+                                    "evaluation": summary})
+        departments_out = []
+        for department_id in sorted(self.departments):
+            manifest = self.departments[department_id]
+            if goal.metric in _declared_metrics(manifest):
+                departments_out.append({
+                    "id": manifest.id,
+                    "name": manifest.description or manifest.id,
+                    "workflows": [item.id for item in manifest.workflows]})
+        agents_out = sorted(
+            agent_id for agent_id in self.agents
+            if agent_id and agent_id != goal.owner_id)
+        value = observation.get(goal.metric, 0)
+        instruction = "bounded direct work with a concrete instruction"
+        message = (f"Goal '{goal.name}' needs its next bounded step: "
+                   f"{goal.metric} is {json.dumps(value)} vs target "
+                   f"{goal.operator} {json.dumps(goal.target)} — choose a "
+                   "candidate workflow or assign bounded direct work.")
+        return {
+            "goal": {"id": goal.id, "name": goal.name, "metric": goal.metric,
+                     "operator": goal.operator, "target": goal.target,
+                     "aggregation": goal.aggregation, "owner_id": goal.owner_id},
+            "metric": goal.metric,
+            "observation_value": value,
+            "evidence": [{"kind": item.kind, "payload_keys": sorted(item.payload)}
+                          for item in context.evidence[-5:]],
+            "memory": [item.claim for item in context.memory[:6]],
+            "children": children,
+            "blockers": blockers,
+            "recent_runs": recent_runs,
+            "candidates": {"departments": departments_out, "agents": agents_out},
+            "valid_answers": ["execute_workflow", "request_agent"],
+            "answer_syntax": {
+                "execute_workflow": (
+                    "company goal decide <goal_id> --kind execute_workflow "
+                    "--workflow <department_id>:<workflow_id>"),
+                "request_agent": (
+                    f"company goal decide <goal_id> --kind request_agent "
+                    f"--agent <agent_id> --instruction \"{instruction}\" "
+                    "--evidence-kind <kind>")},
+            "message": message,
+        }
 
     def evaluate(self, context, decision: Decision, evidence: tuple) -> Evaluation:
         observation = self.observe(context)
@@ -115,9 +281,55 @@ class CatalogController:
 class AssignmentExecutor:
     """Park work for an external Host; never execute a capability implicitly."""
 
+    def __init__(self, memory=None):
+        # F7(b): minimal read access only — when a memory repository is
+        # attached, the parked ask's message carries the claims the
+        # assigned work should build on. Pure reads; the executor stays
+        # a pure parker and never writes.
+        self.memory = memory
+
+    def _memory_line(self, order) -> str | None:
+        """The learning line for one parked ask: the workflow's own
+        workflow-scope claims for a workflow order, goal-relevant claims
+        (never owner profile claims) for a direct one. ``None`` when no
+        claims exist or no memory handle is attached."""
+        if self.memory is None:
+            return None
+        workflow_id = None
+        if order.workflow_run_id:
+            with self.memory.database.connect() as connection:
+                row = connection.execute(
+                    "SELECT workflow_id FROM core_workflow_runs WHERE id=?",
+                    (order.workflow_run_id,)).fetchone()
+            workflow_id = row[0] if row else None
+        if workflow_id:
+            claims = [item.claim for item in self.memory.relevant(
+                scope="workflow", workflow_id=workflow_id)]
+            label = "Workflow learning"
+        else:
+            claims = [item.claim for item in self.memory.relevant(
+                goal_id=order.goal_id) if item.scope != "owner"]
+            label = "Relevant memory"
+        if not claims:
+            return None
+        return f"{label}: " + "; ".join(claims)
+
     def execute(self, agent, order) -> AgentResult:
-        return AgentResult(
-            "ask_user", message=f"WorkOrder {order.id} is ready for Agent {agent.id}")
+        kinds = tuple(order.brief.get("evidence_kinds") or ())
+        if not kinds and order.brief.get("evidence_kind"):
+            kinds = (order.brief["evidence_kind"],)
+        kinds = kinds or ("intervention_result",)
+        message = (
+            f"Agent {agent.id}: execute parked WorkOrder {order.id} — "
+            f"{order.brief.get('instruction')}. Produce evidence kind(s) "
+            f"{', '.join(kinds)} and complete it with `tasks {order.id} "
+            f"--complete {agent.id} --evidence '[...]' --learning "
+            '"<what this taught the workflow>"`. On completion the run '
+            "advances; external actions still park for approval first.")
+        line = self._memory_line(order)
+        if line is not None:
+            message = f"{message}\n{line}"
+        return AgentResult("ask_user", message=message)
 
 
 class CleanCommandRuntime:
@@ -127,13 +339,12 @@ class CleanCommandRuntime:
     # process scope: every model request used to copy the whole database.
     _SNAPSHOT_CACHE: dict[tuple[str, float, int], Path] = {}
     _SNAPSHOT_ROOT: Path | None = None
-    _SNAPSHOT_FINALIZERS: list = []
 
-    def __init__(self, path: str | Path, *, readonly: bool = False):
+    def __init__(self, path: str | Path, *, readonly: bool = False,
+                 controller=None, executor=None):
         self.path = Path(path)
         self.readonly = readonly
         self._readonly_scratch = None
-        self._scratch_finalizer = None
         database_path = self.path
         database_readonly = readonly
         if readonly:
@@ -143,20 +354,38 @@ class CleanCommandRuntime:
             # (path, mtime, size) so repeated host requests over an
             # unchanged database cost one copy, not one per request.
             self._readonly_scratch = self._cached_snapshot(self.path)
-            self._scratch_finalizer = None  # process-lifetime cache owns it
             database_path = self._readonly_scratch / "empty.sqlite"
             database_readonly = False
         self.database = Database(database_path, readonly=database_readonly)
+        agents = available_agents(self._home_from_database())
+        # F6: the GoalController/AgentExecutor seams are injectable; the
+        # defaults are exactly today's clean adapter.
+        controller = controller or CatalogController(self.database, agents=agents)
+        # F7(b): the default executor reads the memory claims a parked
+        # ask should carry (a second read-only repository handle over
+        # the same database; the executor never writes).
+        executor = executor or AssignmentExecutor(
+            memory=MemoryRepository(self.database,
+                                    EvidenceRepository(self.database)))
         self.runtime = GoalRuntime(
-            database_path, CatalogController(self.database), AssignmentExecutor(),
-            agents=available_agents(self._home_from_database()),
+            database_path, controller, executor, agents=agents,
             readonly=database_readonly)
+        # F4: workflow steps execute only for agents their Department
+        # declares, an installed Agent, or the goal owner. The loaded
+        # Department manifests are the declaration source for the first
+        # two; direct assignments are validated against the installed
+        # layer and the goal owner alone. An injected controller without
+        # declarations contributes no department agents.
+        self.runtime.resolution.department_agents = {
+            manifest.id: tuple(manifest.agent_ids or ())
+            for manifest in (getattr(controller, "departments", None) or {}).values()}
         self.goals = self.runtime.goals
         self.runs = self.runtime.runs
         self.interventions = self.runtime.interventions
         self.evidence = self.runtime.evidence
         self.memory = self.runtime.memory
         self.work_orders_repository = WorkOrderRepository(self.database)
+        self.workflows_repository = WorkflowRepository(self.database)
         self.approvals = ApprovalRepository(self.database)
 
     @classmethod
@@ -224,14 +453,13 @@ class CleanCommandRuntime:
         department declares (in ``evidence_metrics`` or
         ``goal_schema["metrics"]``). Otherwise the goal would accept any
         evidence — or worse, none could ever satisfy it. Director-owned
-        goals keep the departmentless ``request_agent`` path.
+        goals keep the departmentless DECIDE boundary: they park a
+        decision_request for the owner instead.
         """
         handler = departments().get(owner_id)
         if handler is None:
             return
-        declared = set(getattr(handler, "evidence_metrics", {}) or ())
-        schema = getattr(handler, "goal_schema", None) or {}
-        declared.update(schema.get("metrics") or ())
+        declared = _declared_metrics(handler)
         if metric in declared:
             return
         listed = ", ".join(sorted(declared)) or "(none declared)"
@@ -370,10 +598,11 @@ class CleanCommandRuntime:
                 visited.add(goal_id)
             for goal_id in sorted(graph):
                 visit(goal_id)
-        if len(roots) != 1:
-            defects.extend({"goal_id": item,
-                            "kind": "disconnected_non_primary_root"}
-                           for item in roots)
+        # F9(b): several independent root Goals are a healthy home, not
+        # a defect — the root ids stay reported (with a canonical root
+        # only when exactly one exists); genuine structural defects
+        # (parent cycles, missing parents, missing edge goals,
+        # abandoned blockers) keep flagging above.
         return {"goal_count": len(goals), "root_goal_ids": roots,
                 "canonical_root_goal_id": roots[0] if len(roots) == 1 else None,
                 "defects": defects}
@@ -387,12 +616,29 @@ class CleanCommandRuntime:
         repository's run-key fallback then satisfies every later
         intervention of the SAME run, so one approval carries a multi-step
         run through all of its remaining gates.
+
+        F9(a): approving answers the current intervention's pending
+        owner ask — its notification is acknowledged BEFORE the run
+        resumes, so an approved ask stops re-delivering while the next
+        gate's own ask (parked by the resumed run) stays pending. A
+        ``--scope step`` approval without an active intervention is a
+        clear error: a DECIDE park is answered with ``goal decide`` and
+        a stalled or review-parked run with ``goal resume``, not
+        approve; ``--scope run`` stays coherent for run-wide pre-grants.
         """
         self._require_writable()
         if scope not in {"step", "run"}:
             raise ValueError("approve scope must be 'step' or 'run'")
         run = self.runs.current(goal_id)
         intervention = self.interventions.active_for_run(run.id)
+        if scope == "step" and intervention is None:
+            raise ValueError(
+                f"goal {goal_id} has no active intervention to approve for "
+                f"--scope step: run {run.sequence} is "
+                f"{run.stage.value}/{run.status}. Answer a DECIDE park with "
+                f"`company goal decide {goal_id} --kind ...`, resume a "
+                f"stalled or review-parked run with `company goal resume "
+                f"{goal_id}`, or grant run-wide keys with --scope run.")
         granted = set(keys)
         if intervention is not None:
             workflow_run = self.runtime.resolution.workflows.active_for_intervention(
@@ -410,8 +656,133 @@ class CleanCommandRuntime:
                 intervention_id=None if (scope == "run" or intervention is None)
                 else intervention.id,
                 note=note)
+        if intervention is not None:
+            # The approved ask is answered: retire its pending
+            # notification before the resume so only a NEW gate's ask
+            # (parked by the resumed run) can re-deliver as pending.
+            with self.database.connect() as connection:
+                connection.execute("""UPDATE core_notifications
+                    SET status='acknowledged',acknowledged_at=?
+                    WHERE intervention_id=? AND kind='owner_input_required'
+                      AND status='pending'""",
+                    (datetime.now(timezone.utc).isoformat(), intervention.id))
         if run.status == "waiting":
             self.runtime.resume(goal_id)
+        return self.status(goal_id)
+
+    def decide_goal(self, goal_id: str, kind: str, *, workflow: str | None = None,
+                    agent: str | None = None, instruction: str | None = None,
+                    evidence_kind: str | None = None):
+        """Answer a decision_request park with one concrete bounded step.
+
+        ``--kind execute_workflow`` adopts one of the candidate Departments'
+        workflows (``<department_id>:<workflow_id>``); ``--kind request_agent``
+        assigns bounded direct work — the instruction is mandatory, which is
+        the anti-content-free rule. Answering resumes the run immediately,
+        exactly like ``engine.resume``.
+        """
+        self._require_writable()
+        goal = self.goals.get(goal_id)
+        run = self.runs.current(goal_id)
+        decision = run.decision
+        if (run.stage != GoalStage.DECIDE or run.status != "waiting"
+                or decision is None or decision.kind != "decision_request"):
+            raise ValueError(
+                f"goal decide answers a Run parked at DECIDE on a "
+                f"decision_request; run {run.sequence} of {goal_id} is "
+                f"{run.stage.value}/{run.status}"
+                + (f" with a {decision.kind} decision" if decision else ""))
+        request = dict((decision.context or {}).get("decision_request") or {})
+        candidates = request.get("candidates") or {}
+        if kind == "execute_workflow":
+            offered = [f"{item['id']}:{workflow_id}"
+                       for item in candidates.get("departments") or []
+                       for workflow_id in item.get("workflows") or []]
+            if workflow not in offered:
+                raise ValueError(
+                    f"workflow {workflow!r} is not one of the candidate "
+                    "workflows for this decision_request: "
+                    + (", ".join(offered) or "(none declared this metric)"))
+            answer = self._adopt_department_workflow(goal_id, workflow)
+        elif kind == "request_agent":
+            agent_id = (agent or "").strip()
+            allowed = sorted(set(candidates.get("agents") or ())
+                             | set(self.runtime.resolution.agents or {}))
+            if not agent_id:
+                raise ValueError(
+                    "request_agent requires --agent (the goal owner or an "
+                    "installed Agent: " + (", ".join(allowed) or goal.owner_id) + ")")
+            if agent_id != goal.owner_id and agent_id not in allowed:
+                raise ValueError(
+                    f"agent {agent_id!r} is neither the goal owner "
+                    f"({goal.owner_id!r}) nor an installed Agent"
+                    + (": " + ", ".join(allowed) if allowed else ""))
+            text = (instruction or "").strip()
+            if not text:
+                raise ValueError(
+                    "request_agent requires --instruction: one bounded, "
+                    "concrete instruction the Agent can execute; the runtime "
+                    "never parks content-free work")
+            answer = Decision(
+                "request_agent", text, None,
+                {"agent_id": agent_id, "evidence_kind": evidence_kind or goal.metric,
+                 "instruction": text})
+        else:
+            raise ValueError("decision kind must be execute_workflow or request_agent")
+        self.runs.update(run.id, stage=GoalStage.ACT, status="ready", decision=answer)
+        self._acknowledge_run_asks(run.id)
+        self.runtime.advance(goal_id)
+        return self.status(goal_id)
+
+    def _adopt_department_workflow(self, goal_id: str, workflow_id: str) -> Decision:
+        """Bind a candidate Department workflow to the goal's current run."""
+        goal = self.goals.get(goal_id)
+        department_id, _, declared_id = workflow_id.partition(":")
+        handler = departments().get(department_id)
+        if handler is None:
+            raise ValueError(f"unknown candidate department: {department_id!r}")
+        workflow = next((item for item in handler.workflows
+                         if item.id == declared_id), None)
+        if workflow is None or not isinstance(workflow, Workflow):
+            raise ValueError(
+                f"department {department_id!r} declares no workflow "
+                f"{declared_id!r}")
+        self.workflows_repository.save(Workflow(
+            workflow_id, workflow.name, workflow.steps, department_id,
+            workflow.version))
+        return Decision("execute_workflow",
+                        f"execute {workflow.name} ({department_id})", workflow_id)
+
+    def _acknowledge_run_asks(self, run_id: str) -> None:
+        """Retire the owner ask a parked run carried once it is answered."""
+        with self.database.connect() as connection:
+            connection.execute("""UPDATE core_notifications
+                SET status='acknowledged',acknowledged_at=?
+                WHERE run_id=? AND status='pending'""",
+                (datetime.now(timezone.utc).isoformat(), run_id))
+
+    def resume_goal(self, goal_id: str):
+        """Open the next run of a parked goal (the stall/review 'continue').
+
+        A DECIDE park is refused: it needs a concrete decision, not a
+        resume — `goal decide` answers it.
+        """
+        self._require_writable()
+        run = self.runs.current(goal_id)
+        if run.status != "waiting":
+            raise ValueError(
+                f"goal {goal_id} is not parked: run {run.sequence} is "
+                f"{run.stage.value}/{run.status}; nothing to resume")
+        if (run.stage == GoalStage.DECIDE and run.decision is not None
+                and run.decision.kind == "decision_request"):
+            raise ValueError(
+                f"goal {goal_id} is waiting for a concrete decision, not a "
+                f"resume: answer the pending ask with `company goal decide "
+                f"{goal_id} --kind execute_workflow --workflow <id>` or "
+                f"`--kind request_agent --agent <id> --instruction "
+                f"'<bounded instruction>' --evidence-kind <kind>`")
+        self._acknowledge_run_asks(run.id)
+        self.runtime.resume(goal_id)
         return self.status(goal_id)
 
     def add_evidence(self, goal_id, *, kind, source, payload, validity=None):
@@ -473,19 +844,27 @@ class CleanCommandRuntime:
                             learning=None):
         """Complete one order atomically; optionally persist learning.
 
-        ``agent_id`` may be the bare agent id or the runtime's historical
-        ``executor:<agent_id>`` claimant — both name the same executor
-        (see company.work_orders.executor_identity). ``learning`` (the
-        ``tasks --complete --learning`` flag) persists workflow-scope
-        memory grounded in the evidence just recorded, with full
-        Goal/Run/Intervention/Workflow lineage enforced by
+        The documented flow is claim-then-complete: an order must already
+        be claimed by exactly ``agent_id`` — the order's declared agent
+        (the runtime pre-claims workflow-step orders with their declared
+        agent, and direct orders carry the owner's own identity when the
+        owner assigned the work to themself). An open order is refused:
+        claiming it first is a separate, explicit step, and a foreign
+        identity raises instead of silently taking the order over.
+        ``learning`` (the ``tasks --complete --learning`` flag) persists
+        workflow-scope memory grounded in the evidence just recorded, with
+        full Goal/Run/Intervention/Workflow lineage enforced by
         MemoryRepository.remember — the same guard the engine path uses.
         """
         self._require_writable()
         order = self.work_orders_repository.get(work_order_id)
         if order.status == "open":
-            order = self.work_orders_repository.claim(work_order_id, agent_id)
-        elif executor_identity(order.claimed_by or "") != executor_identity(agent_id):
+            raise RuntimeError(
+                f"work order {work_order_id} is open: claim it with "
+                f"`tasks {work_order_id} --claim {order.agent_id}` "
+                f"(only its declared agent {order.agent_id!r}) before "
+                "completing")
+        if (order.claimed_by or "") != agent_id:
             raise RuntimeError(
                 f"work order is claimed by {order.claimed_by!r}, not {agent_id!r}")
         if not evidence:
@@ -498,23 +877,18 @@ class CleanCommandRuntime:
                             for item in evidence],
             advance_workflow=bool(order.workflow_run_id), wake_run=True)
         if learning:
-            self._remember_workflow_learning(order, learning, evidence_ids)
+            # L4: the one workflow-learning writer lives on the
+            # ResolutionCycle; the CLI path and the executor path share it.
+            self.runtime.resolution.remember_workflow_learning(
+                order, learning, evidence_ids)
         return {"work_order": self._order(order)}
 
-    def _remember_workflow_learning(self, order, learning, evidence_ids):
-        """Persist workflow memory for a completed order (mirrors the
-        ResolutionCycle executor path: evidence + lineage are mandatory)."""
-        workflow_id = None
-        if order.workflow_run_id:
-            with self.database.connect() as connection:
-                row = connection.execute(
-                    "SELECT workflow_id FROM core_workflow_runs WHERE id=?",
-                    (order.workflow_run_id,)).fetchone()
-            workflow_id = row[0] if row else None
-        return self.memory.remember(
-            "workflow", learning, evidence_ids=tuple(evidence_ids),
-            goal_id=order.goal_id, run_id=order.run_id,
-            intervention_id=order.intervention_id, workflow_id=workflow_id)
+    def retire_memory(self, memory_id: str):
+        """CLI memory hygiene path (`memory retire <id>`): flip one active
+        claim out of the active set without deleting the row or its
+        evidence. The single writer is MemoryRepository.retire."""
+        self._require_writable()
+        return self.memory.retire(memory_id)
 
     def add_memory(self, scope, claim, evidence_ids=(), goal_id=None,
                    run_id=None, intervention_id=None, workflow_id=None):
@@ -575,11 +949,69 @@ class CleanCommandRuntime:
         return {"schema_version": 3, "durable_memory": by_scope,
                 "counts": {scope: len(items) for scope, items in by_scope.items()}}
 
+    def _focus_goal(self, owner_id=None):
+        """F8(a): the projection's focus Goal.
+
+        Ready runs come first, in exactly ``runs.ready()`` priority order
+        (deadline/priority-aware — the same order the scheduler uses; no
+        ad-hoc re-implementation). When nothing is ready the focus falls
+        back to the most recently updated active Goal (the one the loop
+        touched last), still honoring the owner filter.
+        """
+        candidates = {item.id: item for item in self.goals.list()
+                      if item.status == "active"
+                      and (not owner_id or item.owner_id == owner_id)}
+        for run in self.runs.ready():
+            if run.goal_id in candidates:
+                return candidates[run.goal_id]
+        if not candidates:
+            return None
+        ids = list(candidates)
+        marks = ",".join("?" for _ in ids)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                f"""SELECT g.id FROM core_goals g
+                    JOIN core_runs r ON r.goal_id=g.id AND r.sequence=(
+                        SELECT MAX(r2.sequence) FROM core_runs r2
+                        WHERE r2.goal_id=g.id)
+                    WHERE g.id IN ({marks}) AND g.status='active'
+                    ORDER BY r.updated_at DESC,g.created_at DESC,g.id LIMIT 1""",
+                ids).fetchone()
+        if row is not None:
+            return candidates[row[0]]
+        return candidates[ids[0]]
+
+    def _recent_decisions(self, goal_id: str, limit: int = 3) -> list[dict]:
+        """The last ``limit`` decided runs of one Goal (most recent
+        first): sequence, decision kind, and resolution outcome — the
+        same shape the engine's DECIDE context carries."""
+        decisions = []
+        with self.database.connect() as connection:
+            for row in connection.execute(
+                    """SELECT id,sequence,decision_json FROM core_runs
+                       WHERE goal_id=? AND decision_json IS NOT NULL
+                       ORDER BY sequence DESC LIMIT ?""", (goal_id, limit)):
+                outcome = connection.execute(
+                    """SELECT resolution_outcome FROM core_interventions
+                       WHERE run_id=? ORDER BY created_at DESC,rowid DESC
+                       LIMIT 1""", (row["id"],)).fetchone()
+                decisions.append({
+                    "sequence": row["sequence"],
+                    "kind": json.loads(row["decision_json"]).get("kind"),
+                    "resolution_outcome": outcome[0] if outcome else None})
+        return decisions
+
+    def _declaring_departments(self, metric: str) -> list[str]:
+        """Departments whose declarations prove this metric (the D3
+        rule, reusing the controller's loaded registry)."""
+        registry = (getattr(self.runtime.controller, "departments", None)
+                    or departments())
+        return sorted(department_id for department_id, manifest
+                      in registry.items() if metric in _declared_metrics(manifest))
+
     def assemble_context(self, *, prompt="", owner_id=None, workflow_id=None,
                          token_budget=None, **_kwargs):
-        goals = [item for item in self.goals.list()
-                 if item.status == "active" and (not owner_id or item.owner_id == owner_id)]
-        goal = goals[0] if goals else None
+        goal = self._focus_goal(owner_id)
         run = self.runs.current(goal.id) if goal else None
         evidence = self.evidence.for_goal(goal.id)[-20:] if goal else []
         memory = self.memory.relevant(
@@ -590,13 +1022,47 @@ class CleanCommandRuntime:
             lines.append(
                 f"Goal: {goal.name} ({goal.id}) · Run {run.sequence} · {run.stage.value}/{run.status}")
             sources.append(f"goal:{goal.id}")
+        # F8(b): the focus Goal's recent decisions and the Departments
+        # declaring its metric — rendered only when each has content.
+        decisions = self._recent_decisions(goal.id) if goal else []
+        if decisions:
+            lines.append("Recent decisions: " + "; ".join(
+                f"run {item['sequence']} {item['kind']} "
+                f"{item['resolution_outcome'] or 'unresolved'}"
+                for item in decisions))
+        declaring = self._declaring_departments(goal.metric) if goal else []
+        if declaring:
+            lines.append("Departments declaring this metric: "
+                         + ", ".join(declaring))
+        # The whole active goal tree, not only the owner filter's slice:
+        # parents first, children indented beneath them.
+        tree_lines, tree_ids = self._goal_tree()
+        if tree_lines:
+            lines.append("Goals:")
+            lines.extend(tree_lines)
+            sources.extend(tree_ids)
+        blocked = self._blocked_by(goal.id) if goal else []
+        if blocked:
+            lines.append("Blocked by: " + "; ".join(
+                f"{item['name']} ({item['id']}) · {item['status']}"
+                for item in blocked))
+            sources.extend(f"goal:{item['id']}" for item in blocked)
         if evidence:
             lines.append("Evidence: " + "; ".join(
                 f"{item.kind}={json.dumps(item.payload, sort_keys=True)}"
                 for item in evidence))
             sources.extend(item.id for item in evidence)
+        # Recent durable memory across all three scopes; owner profile
+        # claims stay on their own Profile line.
+        recent = [item for item in self.memories(limit=24)
+                  if item["status"] == "active"][:12]
+        if recent:
+            lines.append("Memory: " + "; ".join(
+                f"{item['scope']}: {item['claim']}" for item in recent))
+            sources.extend(str(item["id"]) for item in recent)
         if memory:
-            lines.append("Memory: " + "; ".join(item.claim for item in memory))
+            lines.append("Relevant memory: " + "; ".join(
+                item.claim for item in memory))
             sources.extend(item.id for item in memory)
         attention = self.attention(limit=5)
         if attention:
@@ -620,6 +1086,46 @@ class CleanCommandRuntime:
                 "goal_id": goal.id if goal else None,
                 "run_id": run.id if run else None,
                 "workflow_id": workflow_id}
+
+    def _goal_tree(self, limit: int = 12):
+        """Render every active Goal as a parent-first tree with children
+        indented. Returns (lines, goal ids); a Goal without a run renders
+        without its run segment."""
+        active = [item for item in self.goals.list() if item.status == "active"]
+        by_parent: dict[str | None, list] = {}
+        for item in active:
+            by_parent.setdefault(item.parent_id, []).append(item)
+        lines: list[str] = []
+        ids: list[str] = []
+        roots = by_parent.get(None, []) + [
+            item for item in active
+            if item.parent_id is not None and item.parent_id not in
+            {other.id for other in active}]
+        def render(goal, depth: int) -> None:
+            if len(ids) >= limit:
+                return
+            try:
+                run = self.runs.current(goal.id)
+                segment = f" · Run {run.sequence} · {run.stage.value}/{run.status}"
+            except KeyError:
+                segment = ""
+            lines.append(f"{'  ' * depth}{goal.name} ({goal.id}){segment} · {goal.metric}")
+            ids.append(f"goal:{goal.id}")
+            for child in by_parent.get(goal.id, []):
+                render(child, depth + 1)
+        for root in roots:
+            render(root, 0)
+            if len(ids) >= limit:
+                break
+        return lines, ids
+
+    def _blocked_by(self, goal_id: str) -> list[dict]:
+        with self.database.connect() as connection:
+            return [dict(row) for row in connection.execute(
+                """SELECT g.id,g.name,g.status FROM core_goal_edges e
+                   JOIN core_goals g ON g.id=e.source_goal_id
+                   WHERE e.target_goal_id=? AND e.relation='blocks'
+                     AND g.status!='complete'""", (goal_id,))]
 
     def notifications(self, status="pending", limit=100, goal_id=None, **_kwargs):
         clauses, args = ["status=?"], [status]

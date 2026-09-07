@@ -89,6 +89,24 @@ Fresh homes start with **zero** Departments — add clean declarative packages
 only when their Goal, Workflow, Agent, Evidence, and approval contracts are
 ready.
 
+Executor identity is enforced: a WorkOrder executes only for its declared
+agent (exact string, no aliases), claims are claim-then-complete, and work
+for an agent that is neither installed, nor the goal owner, nor declared by
+the owning Department is refused upfront and escalated to the owner instead.
+
+Memory retrieval is topology-aware: a Goal's relevant memory carries the
+strategy claims of Goals it is structurally related to (same owner and
+metric, parent, child, or supports edge), parked asks append the workflow
+or goal-relevant learning they should build on, and every WorkOrder brief
+carries that bounded `memory` list so the next execution differs from the
+last — memory is causal, not decorative. Strategy memory stays selective —
+completing a goal writes no new strategy claims; owners and evidence-backed
+host distillation are the only strategy writers, operational lessons are
+the only per-completion writes, and stale claims retire with
+`memory retire` without losing their evidence. Approvals acknowledge
+their answered asks, and unknown comparison operators raise instead of
+silently failing closed.
+
 Useful commands:
 
 ```sh
@@ -96,6 +114,7 @@ spielos status
 spielos overview
 spielos context
 spielos memory summary
+spielos memory retire <memory_id>
 spielos profile list
 spielos notifications list
 spielos runner tick

@@ -15,7 +15,7 @@ from pathlib import Path
 # the six canonical user layers (user layers survive `spielos update`).
 VENDORED_ROOT_FOLDERS = frozenset({
     "agents", "assets", "capabilities", "commands", "connections", "context",
-    "departments", "evidence", "evals", "goals", "hosts", "memory",
+    "departments", "evidence", "evals", "goals", "memory",
     "observability", "resolution", "runtime", "skills", "state", "strategy",
     "work_orders", "workflows",
 })
@@ -28,12 +28,8 @@ VENDORED_ROOT_FILES = frozenset({
 
 # Spine modules that live at the root of a user layer (for example
 # skills/core.py); user content in those layers is folder-shaped. registry.py
-# is vendored in skills/capabilities but user-created in connections/.
+# is user-created in connections/.
 VENDORED_LAYER_FILES = frozenset({"__init__.py", "core.py"})
-VENDORED_LAYER_FILES_BY_LAYER = {
-    "skills": frozenset({"registry.py"}),
-    "capabilities": frozenset({"registry.py"}),
-}
 
 # Names owned by host agents; a Skill or Department must never take one.
 RESERVED_AGENT_NAMES = frozenset({
@@ -66,8 +62,7 @@ def _layer_counts(company: Path) -> dict:
     def count_files(layer: Path, layer_name: str | None = None) -> int:
         if not layer.is_dir():
             return 0
-        vendored = VENDORED_LAYER_FILES | (
-            VENDORED_LAYER_FILES_BY_LAYER.get(layer_name or "", frozenset()))
+        vendored = VENDORED_LAYER_FILES
         return sum(1 for item in layer.iterdir() if item.is_file()
                    and not item.name.startswith(".")
                    and item.name not in vendored)
@@ -138,8 +133,7 @@ def audit(root: Path) -> dict:
 
     skills = company / "skills"
     if skills.is_dir():
-        vendored_skills = VENDORED_LAYER_FILES | (
-            VENDORED_LAYER_FILES_BY_LAYER.get("skills", frozenset()))
+        vendored_skills = VENDORED_LAYER_FILES
         for entry in sorted(skills.iterdir()):
             if entry.name == "__pycache__":
                 continue

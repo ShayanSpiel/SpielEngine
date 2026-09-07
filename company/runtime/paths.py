@@ -4,9 +4,9 @@ Resolution order — deterministic first:
 
 1. **Vendored anchor**: if this very file lives inside a real SpielOS home
    (its checkout root contains ``.spielos/`` or ``.agents/``), that root is
-   returned unconditionally. This is the historical behavior: every process
-   — Runner, plugin, or host — resolves to the same home no matter
-   what its cwd is.
+   returned unconditionally. This is the deterministic contract: every
+   process — plugin, host, or command — resolves to the same home no
+   matter what its cwd is.
 2. ``SPIELOS_HOME`` environment variable (explicit override for installed
    console-script usage).
 3. Nearest ancestor of the current working directory that looks like a
@@ -103,19 +103,3 @@ def validate_home_destination(candidate: str | Path) -> Path:
 
 def _in_site_packages(home: Path) -> bool:
     return "site-packages" in str(home) or "/.venv/" in str(home) + "/"
-
-
-def skills_root(project_root: Path | None = None) -> Path:
-    """The reusable company Skill root.
-
-    Department-local Skills are discovered beside their owning Department by
-    :mod:`company.agents`; there is intentionally no third Skill namespace.
-    """
-    root = project_root or find_project_root()
-    candidate = root / ".agents" / "company" / "skills"
-    if candidate.is_dir():
-        return candidate
-    source = Path(__file__).resolve().parents[1] / "skills"
-    if source.is_dir():
-        return source
-    return candidate

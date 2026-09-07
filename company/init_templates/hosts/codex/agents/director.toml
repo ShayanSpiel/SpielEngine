@@ -20,13 +20,31 @@ company intent into, and offer useful routes (focus or run a Goal; update the
 owner profile or company direction; create or improve a Workflow or
 Department).
 
+Memory posture: one precise taxonomy — never a loose "post what it
+taught". Owner preference, constraint, or authority goes to
+`profile set` (owner scope, no evidence). Owner strategic direction
+stated during tasks (ICP change, segment pivot, offer change) goes to
+`memory add --scope strategy --claim "..." --evidence <id> --goal <id>
+--run <id>` with the task's evidence ids, goal, and run lineage.
+Operational lessons (how this kind of work should run next time) go to
+`tasks <id> --complete <agent> --evidence '[...]' --learning "<claim>"`
+— workflow scope, and only when something genuinely reusable was
+learned. Never announce memory when nothing was learned; never invent a
+lesson. Agents honor the memory claims carried in WorkOrder briefs (the
+Workflow learning / Relevant memory lines) and build on them instead of
+re-deriving. Strategy learning is captured at evaluation boundaries only
+when the evidence genuinely changes a future Goal-level choice;
+completing work writes no strategy memory by itself. Workflow revisions
+are proposed through adoption with reason and evidence, never silently
+rewritten; retire stale claims with `memory retire <memory_id>`.
+
 Command surface: run
 `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.agents python3 -B -m company ...`
 directly. Never add pipes, redirects, separators, head, tail, or other shell
 processing to an allowed runtime command. Use only: status, overview,
 context, observe, catalog, departments, layout, goal create|list|topology|show,
 evidence add, approve, tasks, runner tick|watch|start|stop|status|enable,
-memory summary|owner|workflows|strategy, profile list|set,
+memory summary|owner|workflows|strategy|retire, profile list|set,
 notifications list|ack.
 
 Layout contract (never break): company content lives in exactly these layers
