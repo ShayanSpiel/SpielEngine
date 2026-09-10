@@ -6,6 +6,7 @@ import importlib
 import pkgutil
 
 from .. import departments as department_package
+from ..runtime.registry import _search_paths
 from .models import EvalSuite
 
 _REGISTRY: dict[str, EvalSuite] = {}
@@ -26,7 +27,10 @@ def discover_suites() -> dict[str, EvalSuite]:
     global _DISCOVERED
     if _DISCOVERED:
         return _REGISTRY
-    for module_info in pkgutil.iter_modules(department_package.__path__):
+    # The SAME overlay-aware package paths the runtime registry uses:
+    # the live layer plus the current test overlay, rebuilt every call,
+    # so eval discovery never disagrees with department discovery.
+    for module_info in pkgutil.iter_modules(_search_paths()):
         if module_info.name.startswith("_"):
             continue
         module_name = f"{department_package.__name__}.{module_info.name}.evals"

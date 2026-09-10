@@ -228,6 +228,77 @@ class UpdatePreservationTests(unittest.TestCase):
                 self.assertTrue((agents / rel).is_file(), rel)
             self.assertTrue((home / ".opencode" / "plugins" / "mine.ts").is_file())
 
+    def test_pre_manifest_home_refreshes_shipped_adapters_keeps_owner_files(self):
+        """Pre-manifest homes: shipped adapters refresh, owner files stay.
+
+        Homes created before the vendored manifest existed carry no history
+        to consult, so `update` must still refresh every host-adapter file
+        the current release itself ships (Director prompts, Codex hooks,
+        the notifications plugin) to the new release bytes while keeping
+        every owner file at a path the release does not ship — including
+        .codex paths outside the classic user layers.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            home = base / "home"
+            release = base / "release"
+            _copy_real_templates(release)
+
+            self._init(release, home)
+            # Legacy home: no manifest at all.
+            (home / ".spielos" / "vendored.json").unlink()
+
+            # Owner content at paths the release does not ship.
+            owner = {
+                ".codex/agents/custom.toml": 'name = "custom"\n',
+                ".codex/agents/other.toml": 'name = "other"\n',
+                ".codex/workflow/scout.md": "# scout\n",
+                ".opencode/agents/my-agent.md": "---\ndescription: mine\n---\n",
+            }
+            for rel, content in owner.items():
+                path = home / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            # Diverged old-generation adapter content at template paths.
+            stale = {
+                ".codex/agents/director.toml": "# OLD director\n",
+                ".codex/hooks.json": '{\n  "old": true\n}\n',
+                ".codex/hooks/spielos-context.py": "# OLD hook\n",
+                ".opencode/agents/director.md": "OLD director\n",
+            }
+            for rel, content in stale.items():
+                (home / rel).write_text(content)
+
+            self._update(release, home)
+
+            # Every template-path adapter equals the release bytes.
+            shipped = {
+                ".codex/agents/director.toml":
+                    release / "hosts" / "codex" / "agents" / "director.toml",
+                ".codex/hooks.json":
+                    release / "hosts" / "codex" / "hooks.json",
+                ".codex/hooks/spielos-context.py":
+                    release / "hosts" / "codex" / "hooks" / "spielos-context.py",
+                ".codex/hooks/spielos-attention.py":
+                    release / "hosts" / "codex" / "hooks" / "spielos-attention.py",
+                ".opencode/agents/director.md":
+                    release / "hosts" / "opencode" / "agents" / "director.md",
+                ".opencode/plugins/spielos-notifications.ts":
+                    release / "hosts" / "opencode"
+                    / "plugins" / "spielos-notifications.ts",
+            }
+            for rel, source in shipped.items():
+                self.assertEqual(
+                    source.read_text(), (home / rel).read_text(),
+                    f"{rel} must equal the release template bytes")
+            # Every non-template owner file survives byte-identical.
+            for rel, content in owner.items():
+                self.assertTrue((home / rel).is_file(), rel)
+                self.assertEqual(content, (home / rel).read_text(), rel)
+            # The update restores the manifest, so the next update prunes
+            # residue the current release no longer ships.
+            self.assertTrue((home / ".spielos" / "vendored.json").is_file())
+
     def test_fresh_init_writes_manifest_and_canonical_config(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

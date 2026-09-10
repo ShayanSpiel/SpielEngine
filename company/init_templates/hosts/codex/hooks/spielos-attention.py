@@ -11,12 +11,29 @@ import json
 import sys
 from pathlib import Path
 
-REPORTABLE = {"owner_input_required"}
+# Two attention kinds reach the host session: genuine owner asks
+# and host-dispatched work (a parked WorkOrder its assigned
+# Agent executes). The Director renders the former to the owner
+# and executes the latter.
+REPORTABLE = {"owner_input_required", "host_work_required"}
 
 
 def _looks_like_home(candidate: Path) -> bool:
-    return ((candidate / ".agents" / "company").is_dir()
-            or (candidate / "company").is_dir())
+    """A candidate is a home only when it carries a runnable spine: the
+    vendored marker `.agents/company/__main__.py` or the flat
+    `company/__main__.py` — the OpenCode adapter's homeAt check that
+    survived the 2026-09-04 server-cwd incident. A stub `.agents/company/`
+    without `__main__.py` (agent state in a hybrid source checkout) is
+    not a vendored home.
+    """
+    return ((candidate / ".agents/company/__main__.py").is_file()
+            or (candidate / "company/__main__.py").is_file())
+
+
+def _vendored_spine(root: Path) -> bool:
+    """The spine under `root/.agents` is importable only with its marker
+    file; without it the flat `root/company` spine is the true one."""
+    return (root / ".agents/company/__main__.py").is_file()
 
 
 def _root(request: dict) -> Path:
@@ -44,8 +61,8 @@ def main() -> int:
         except json.JSONDecodeError:
             request = {}
         root = _root(request)
-        vendored = root / ".agents"
-        sys.path.insert(0, str(vendored if vendored.is_dir() else root))
+        vendored = root / ".agents" if _vendored_spine(root) else None
+        sys.path.insert(0, str(vendored if vendored is not None else root))
         from company.commands import CleanCommandRuntime
 
         database = root / ".spielos" / "state" / "company.sqlite"

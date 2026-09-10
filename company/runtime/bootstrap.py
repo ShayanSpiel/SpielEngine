@@ -33,7 +33,10 @@ from .paths import package_vendored_root, validate_home_destination
 # Owner-created content that `spielos update` must never touch, per tree
 # (relative paths inside that tree). Everything the release ships is
 # vendored: it is tracked in .spielos/vendored.json, refreshed on update,
-# and pruned when a newer release stops shipping it.
+# and pruned when a newer release stops shipping it. In a home with no
+# manifest yet (created before the manifest era), the guard cannot know
+# what an older release vendored, so it preserves every path the current
+# release itself does not ship and refreshes the ones it does.
 USER_LAYER_PREFIXES = {
     "agents": (
         "company/departments/",
@@ -331,28 +334,35 @@ def scaffold(target: Path | None = None, *, force: bool = False,
 
     manifest = _load_manifest(root) if existing_home else None
 
-    def layer_guard(tree: str):
-        """True for owner-created files in preserved layers (never vendored)."""
-        prefixes = USER_LAYER_PREFIXES.get(tree, ())
-        tracked = set(manifest.get(tree, ())) if manifest is not None else None
-
-        def is_user(rel: str) -> bool:
-            if not any(rel.startswith(prefix) for prefix in prefixes):
-                return False
-            if tracked is None:
-                # A pre-manifest home cannot distinguish user files from old
-                # vendored residue; every user-layer file is preserved.
-                return True
-            return rel not in tracked
-
-        return is_user
-
     def vendored_entries() -> dict[str, list[str]]:
         entries = {"agents": _template_files(templates / "agents")}
         for name in ("opencode", "codex"):
             source = templates / "hosts" / name
             entries[name] = _template_files(source) if source.is_dir() else []
         return entries
+
+    def layer_guard(tree: str):
+        """True for owner-created files in preserved layers (never vendored)."""
+        prefixes = USER_LAYER_PREFIXES.get(tree, ())
+        tracked = set(manifest.get(tree, ())) if manifest is not None else None
+        # Rel paths the current release itself ships in this tree — the
+        # only paths a home with no manifest can prove vendored.
+        shipped = (set(vendored_entries().get(tree, ()))
+                   if tracked is None else None)
+
+        def is_user(rel: str) -> bool:
+            if tracked is None:
+                # A pre-manifest home has no vendored history to consult:
+                # a path the current release itself ships is vendored and
+                # refreshes; every other path could be owner content (or
+                # stale residue that cannot be proven vendored), so it is
+                # preserved. The manifest this update writes resolves it.
+                return rel not in shipped
+            if not any(rel.startswith(prefix) for prefix in prefixes):
+                return False
+            return rel not in tracked
+
+        return is_user
 
     notify("Vendoring harness spine")
     if existing_home and force:

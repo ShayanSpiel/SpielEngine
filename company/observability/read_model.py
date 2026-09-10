@@ -110,32 +110,54 @@ class Observer:
             memory = {row[0]: row[1] for row in connection.execute("""
                 SELECT scope, COUNT(*) FROM core_memory
                 WHERE status='active' GROUP BY scope""")}
-            # L3 repetition signal: the same bounded direct work executed
-            # over and over is the strongest hint the work merits a
-            # reusable Workflow. Three or more completed direct orders on
-            # one goal, by the same agent, with the same instruction,
-            # surface as one bounded entry (newest shapes first, at most
-            # five). Read-only projection — no clustering, no embeddings.
-            shapes: dict[tuple[str, str, str], int] = {}
-            for row in connection.execute("""SELECT goal_id, agent_id, brief_json
-                FROM core_work_orders
-                WHERE step_id='direct' AND status='completed'"""):
-                instruction = " ".join(
-                    (json.loads(row["brief_json"]).get("instruction")
-                     or "").split())
-                if not instruction:
-                    continue
-                shape = (row["goal_id"], row["agent_id"], instruction)
-                shapes[shape] = shapes.get(shape, 0) + 1
+            # L3 repetition signal (issue #3): the same bounded direct
+            # work executed over and over is the strongest hint the work
+            # is reusable operational structure. The shape is the
+            # EXECUTION pattern — same goal, same agent, same evidence
+            # kind, same payload-key signature — so materially
+            # equivalent work groups even when each instruction is
+            # worded differently (the semantic repetition DECIDE
+            # crystallizes a Workflow from). Three or more completed
+            # orders surface as one bounded entry (at most five).
+            # Read-only projection — no clustering, no embeddings.
+            # Column order mirrors the SELECT below: 0 goal_id, 1
+            # agent_id, 2 evidence kind, 3 evidence payload, 4 order brief.
+            shapes: dict[tuple, dict] = {}
+            for row in connection.execute("""SELECT work.goal_id, work.agent_id,
+                evidence.kind, evidence.payload_json, work.brief_json, work.id
+                FROM core_work_orders work
+                JOIN core_evidence evidence ON evidence.work_order_id=work.id
+                WHERE work.step_id='direct' AND work.status='completed'"""):
+                try:
+                    signature = tuple(sorted(json.loads(row[3])))
+                except (json.JSONDecodeError, TypeError):
+                    signature = ()
+                shape = (row[0], row[1], row[2], signature)
+                entry = shapes.setdefault(shape, {
+                    "goal_id": row[0], "agent_id": row[1],
+                    "evidence_kind": row[2], "orders": [],
+                    "instructions": []})
+                entry["orders"].append(row[5])
+                try:
+                    instruction = " ".join(
+                        (json.loads(row[4]).get("instruction") or "").split())
+                except (json.JSONDecodeError, TypeError):
+                    instruction = ""
+                if instruction:
+                    entry["instructions"].append(instruction)
             repetition = [
-                {"goal_id": goal_id, "agent_id": agent_id,
-                 "completed_orders": count, "instruction": instruction,
-                 "suggestion": "three similar direct WorkOrders — this work "
-                               "may merit a reusable Workflow proposed "
-                               "through adoption"}
-                for (goal_id, agent_id, instruction), count
-                in sorted(shapes.items(), key=lambda item: (-item[1], item[0]))
-                if count >= 3][:5]
+                {"goal_id": entry["goal_id"], "agent_id": entry["agent_id"],
+                 "evidence_kind": entry["evidence_kind"],
+                 "completed_orders": len(entry["orders"]),
+                 "instruction": (entry["instructions"][-1]
+                                 if entry["instructions"] else None),
+                 "suggestion": "this repeated work is reusable operational "
+                               "structure — the runtime crystallizes a "
+                               "Workflow from it"}
+                for entry in sorted(
+                    shapes.values(),
+                    key=lambda item: (-len(item["orders"]), item["goal_id"]))
+                if len(entry["orders"]) >= 3][:5]
         return {"health": self.health(), "goals": goals,
                 "attention": attention, "memory": memory,
                 "repetition": repetition}

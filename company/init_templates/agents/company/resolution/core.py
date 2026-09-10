@@ -37,6 +37,12 @@ class ResolutionOutcome(str, Enum):
     RETURN_TO_GOAL = "RETURN_TO_GOAL"
     ESCALATE_TO_GOAL = "ESCALATE_TO_GOAL"
     ASK_USER = "ASK_USER"
+    # Host dispatch, never an owner ask: the assigned Agent (a host-side
+    # persona) executes the parked WorkOrder and completes it.
+    HOST_WORK = "HOST_WORK"
+    # A structural defect in the Workflow or its wiring: the engine
+    # opens a bounded system-improvement Goal, repairs, and resumes.
+    SYSTEM_DEFECT = "SYSTEM_DEFECT"
 
 
 @dataclass(frozen=True)
@@ -56,6 +62,8 @@ class ResolutionResult:
     outcome: ResolutionOutcome
     intervention: Intervention
     message: str = ""
+    #: The classified structural defect for a SYSTEM_DEFECT outcome.
+    defect: "StructuralDefect | None" = None
 
 
 class InterventionRepository:
@@ -154,6 +162,25 @@ class ApprovalRepository:
                      intervention_id, key, "approved", note, stamp, stamp))
 
 
+@dataclass(frozen=True)
+class StructuralDefect:
+    """One classified structural defect (issue: immediate self-repair).
+
+    ``kind`` is one of:
+    - ``step_contract``  — the step declares evidence kinds its executor
+      cannot produce (declared vs actual contradiction);
+    - ``wiring``         — the declared executor is missing or lacks the
+      declared skills/connections/capabilities;
+    - ``behavior``       — the executor itself reports defective
+      Workflow behavior (wrong format, bad UX, missing validation).
+    """
+
+    kind: str
+    summary: str
+    workflow_id: str | None = None
+    step_id: str | None = None
+
+
 class ResolutionCycle:
     """Own Workflow execution until a meaningful boundary is reached."""
 
@@ -177,6 +204,42 @@ class ResolutionCycle:
         self.memory = MemoryRepository(database, self.evidence)
         self.approvals = ApprovalRepository(database)
         self.goals = GoalRepository(database)
+
+    def _wiring_defect(self, step, workflow_id: str | None = None) -> "StructuralDefect | None":
+        """Issue #11: enforce an INSTALLED agent's declared capabilities.
+
+        A declared executor that is installed (``agents/installed``) is
+        only permitted to execute a step it declares the skills,
+        connections, and capabilities for. A bare agent id (a Department
+        persona that is not installed, or the goal owner) carries no
+        declaration to enforce and passes — existence is validated
+        separately by ``_executor_is_valid``.
+        """
+        agent = self.agents.get(step.agent_id)
+        if agent is None:
+            return None
+        missing_skills = [item for item in step.skill_ids
+                          if item not in agent.skill_ids]
+        missing_connections = [item for item in step.connection_ids
+                               if item not in agent.connection_ids]
+        missing_capabilities = [
+            item for item in (step.requirements or {}).get("capabilities", ())
+            if item not in agent.capability_ids]
+        problems = []
+        if missing_skills:
+            problems.append(f"skills {missing_skills}")
+        if missing_connections:
+            problems.append(f"connections {missing_connections}")
+        if missing_capabilities:
+            problems.append(f"capabilities {missing_capabilities}")
+        if not problems:
+            return None
+        return StructuralDefect(
+            "wiring",
+            f"workflow step {step.id!r} requires {', '.join(problems)} "
+            f"that installed agent {step.agent_id!r} does not declare — "
+            "the step's declared wiring does not match its executor",
+            workflow_id=workflow_id, step_id=step.id)
 
     def _executor_is_valid(self, agent_id: str, owner_id: str,
                            department_declared: tuple[str, ...] = ()) -> bool:
@@ -263,6 +326,13 @@ class ResolutionCycle:
         for step in pending_steps:
             if self._executor_is_valid(step.agent_id, owner_id,
                                        department_declared):
+                # Issue #11: an installed agent is only permitted to
+                # execute a step it declares the skills, connections,
+                # and capabilities for. A wiring mismatch is a structural
+                # defect — repair the declaration, never execute it.
+                wiring = self._wiring_defect(step, workflow_id)
+                if wiring is not None:
+                    return self._defect(intervention, wiring)
                 continue
             return self._finish(
                 intervention, ResolutionOutcome.ESCALATE_TO_GOAL,
@@ -331,6 +401,22 @@ class ResolutionCycle:
                 evidence = tuple(result.evidence) or (AgentEvidence(
                     result.evidence_kind or step.evidence_kind or "workflow_result",
                     result.payload),)
+                required = set(step.evidence_kinds)
+                supplied = {item.kind for item in evidence}
+                if required and not required.issubset(supplied):
+                    # A step contract its executor cannot satisfy is a
+                    # structural defect (issue #4/#8): declared vs actual
+                    # behavior contradicts. Repair the definition, do
+                    # not retry the same broken shape.
+                    self.work_orders.fail(order.id, "step evidence contract mismatch",
+                                          executor_id=order.claimed_by or "")
+                    return self._defect(intervention, StructuralDefect(
+                        "step_contract",
+                        f"step {step.id!r} declares evidence kinds "
+                        f"{sorted(required)} but its executor completed "
+                        f"with {sorted(supplied)}; the step contract "
+                        "contradicts the actual behavior",
+                        workflow_id=workflow_run.workflow_id, step_id=step.id))
                 order, evidence_ids = self.work_orders.complete_with_evidence(
                     order.id, result.payload, executor_id=order.claimed_by or "",
                     kind=evidence[0].kind, payload=evidence[0].payload,
@@ -352,6 +438,20 @@ class ResolutionCycle:
             if result.status == "escalate":
                 return self._finish(intervention, ResolutionOutcome.ESCALATE_TO_GOAL,
                                     result.message or "Goal-level decision is invalid")
+            if result.status == "defect":
+                # The executor reports a structural defect in the
+                # Workflow's behavior (wrong format, bad UX, missing
+                # validation): repair immediately, never retry.
+                return self._defect(intervention, StructuralDefect(
+                    "behavior",
+                    result.message or "the executor reported a structural "
+                    "Workflow defect",
+                    workflow_id=workflow_run.workflow_id, step_id=step.id))
+            if result.status == "host_work":
+                self.workflows.set_status(workflow_run.id, "waiting")
+                return self._finish(intervention, ResolutionOutcome.HOST_WORK,
+                                    result.message or f"work order {order.id} is "
+                                    "ready for its assigned Agent")
             return self._finish(intervention, ResolutionOutcome.ASK_USER,
                                 result.message or "user context or authority required")
 
@@ -372,9 +472,12 @@ class ResolutionCycle:
         # installed Agent executes those.
         owner_id = self.goals.get(intervention.goal_id).owner_id
         if not self._executor_is_valid(agent_id, owner_id):
-            return self._finish(
-                intervention, ResolutionOutcome.ESCALATE_TO_GOAL,
-                UNINSTALLED_DIRECT_AGENT_MESSAGE.format(agent_id=agent_id))
+            # An assigned direct executor that does not exist is a
+            # structural wiring defect (issue #4), not a goal-strategy
+            # problem: repair the assignment, do not re-decide blind.
+            return self._defect(intervention, StructuralDefect(
+                "wiring",
+                UNINSTALLED_DIRECT_AGENT_MESSAGE.format(agent_id=agent_id)))
         with self.database.connect() as connection:
             completed = connection.execute("""SELECT work.id
                 FROM core_work_orders AS work
@@ -404,10 +507,17 @@ class ResolutionCycle:
                 evidence = tuple(result.evidence) or (AgentEvidence(
                     result.evidence_kind or intervention.context.get(
                         "evidence_kind", "intervention_result"), result.payload),)
-                self.work_orders.complete_with_evidence(
+                order, evidence_ids = self.work_orders.complete_with_evidence(
                     order.id, result.payload, executor_id=order.claimed_by or "",
                     kind=evidence[0].kind, payload=evidence[0].payload,
                     evidence_items=[(item.kind, item.payload) for item in evidence])
+                if result.workflow_learning:
+                    # Issue #10: direct AgentResult learning goes through
+                    # the ONE canonical operational-learning writer —
+                    # the same one the CLI and workflow paths use — so a
+                    # reusable direct lesson never disappears.
+                    self.remember_workflow_learning(
+                        order, result.workflow_learning, evidence_ids)
                 return self._finish(intervention, ResolutionOutcome.RETURN_TO_GOAL,
                                     "direct intervention completed and validated")
             if result.status == "fixable":
@@ -422,10 +532,36 @@ class ResolutionCycle:
             if result.status == "escalate":
                 return self._finish(intervention, ResolutionOutcome.ESCALATE_TO_GOAL,
                                     result.message or "Goal-level decision is invalid")
+            if result.status == "defect":
+                return self._defect(intervention, StructuralDefect(
+                    "behavior", result.message or "the executor reported a "
+                    "structural defect in this work"))
+            if result.status == "host_work":
+                return self._finish(intervention, ResolutionOutcome.HOST_WORK,
+                                    result.message or f"work order {order.id} is "
+                                    "ready for its assigned Agent")
             return self._finish(intervention, ResolutionOutcome.ASK_USER,
                                 result.message or "user context or authority required")
         return self._finish(intervention, ResolutionOutcome.CONTINUE_LOCAL,
                             "local iteration budget reached; resume Resolution")
+
+    def _defect(self, intervention: Intervention,
+                defect: StructuralDefect) -> ResolutionResult:
+        """Classify one structural defect durably and hand it to the engine.
+
+        The defect Evidence row (kind ``system_defect``) is the proof the
+        bounded system-improvement Goal is built from; the engine opens
+        that goal, repairs, and resumes this intervention's run. Defect
+        detection is immediate — one broken execution is enough.
+        """
+        self.evidence.record(
+            goal_id=intervention.goal_id, run_id=intervention.run_id,
+            intervention_id=intervention.id, kind="system_defect",
+            payload={"defect_kind": defect.kind, "summary": defect.summary,
+                     "workflow_id": defect.workflow_id,
+                     "step_id": defect.step_id})
+        return ResolutionResult(ResolutionOutcome.SYSTEM_DEFECT, intervention,
+                                defect.summary, defect=defect)
 
     def _finish(self, intervention: Intervention, outcome: ResolutionOutcome,
                 message: str) -> ResolutionResult:

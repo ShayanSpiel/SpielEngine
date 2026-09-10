@@ -52,12 +52,18 @@ spielos update --dir .    # refresh this home (global CLI, after pipx upgrade)
 Always run `update` through the global `spielos` command — it refreshes the
 home from the installed release's templates. Running
 `PYTHONPATH=.agents python3 -m company update` inside the home would try to
-copy the home's own files onto themselves. `update` overwrites only the
-vendored `.agents/` spine and host adapters; private `.spielos/` state,
+copy the home's own files onto themselves. `update` overwrites the vendored
+`.agents/` spine and the host-adapter files the release itself ships
+(Director prompts, Codex hooks, the notifications plugin) — those always
+refresh to the current release bytes, including in homes created before the
+vendored manifest existed. Private `.spielos/` state,
 `opencode.json`/`AGENTS.md` owner edits, and every owner-created file in the
 user layers (Departments, Skills, Capabilities, Connections, Strategy,
-installed Agents, host agents/commands/plugins) are always preserved, while
-stale files from older releases are pruned.
+installed Agents, host agents/commands/plugins) are always preserved. In a
+home with a vendored manifest, stale files from older releases are pruned; a
+pre-manifest home has no history to consult, so it keeps every file the
+release does not ship and the manifest written by the update resolves that
+on the next one.
 
 ## Executor identity (declared-agent claims)
 
@@ -84,9 +90,12 @@ owner parks a structured decision request instead of inventing work.
 - A Goal whose owner is not a Department (or whose Department declares no
   workflow) parks a decision request: the Run stays at DECIDE/waiting, one
   owner notification carries what is needed, why, the candidate Departments
-  and workflows that declare the metric, the installed Agents, and the
-  exact answer syntax. No Intervention and no WorkOrder is created — no
-  content-free "choose bounded work" order can exist.
+  and workflows that declare the metric, and the installed Agents. No
+  Intervention and no WorkOrder is created — no content-free "choose
+  bounded work" order can exist. The owner-facing fields are owner prose
+  (goal name, human progress, named options); the exact answer syntax rides
+  the payload for the Director, which records the owner's plain-words
+  answer through the CLI itself.
 - The owner answers with `goal decide`: `--kind execute_workflow` adopts
   one of the candidate workflows, or `--kind request_agent` assigns bounded
   direct work whose instruction is mandatory (an empty instruction is
@@ -147,9 +156,23 @@ Workflow proposed through adoption.
 focus follows `runs.ready()` priority order (deadline/priority aware —
 the same order the loop schedules in), falling back to the most recently
 updated active Goal when nothing is ready. For the focus goal the
-projection renders a `Recent decisions` line (the last 3 runs: sequence,
-decision kind, resolution outcome) and a `Departments declaring this
-metric` line, each only when it has content.
+projection renders a `Recent decisions` line (each of the last 3 runs in
+plain words) and a `Departments that can move this goal` line, each only
+when it has content.
+
+## Owner voice
+
+Owner-facing text is human narration from start to finish: goals render by
+name with human progress ("0 of 1 customers per week"), evidence renders as
+outcome sentences ("replies 2, sent 10000"), the loop position renders in
+plain words ("next step: choosing the next move"), and parks ask in plain
+words with named options. Raw ids, metric keys, stage/status enums,
+payloads, and CLI answer syntax never enter owner-facing text: the
+projection carries them in one compact `Machine reference` line at the
+end, and parked asks carry them in their payload machine fields — the
+Director quotes them only when the owner asks for technical detail. The
+owner answers in plain words; the Director records the answer through the
+CLI (`goal decide`, `goal resume`, `approve`).
 
 ## Owner-ask hygiene
 

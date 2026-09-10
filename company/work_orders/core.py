@@ -187,9 +187,16 @@ class WorkOrderRepository:
         """Atomically complete an order, record Evidence, and advance its execution."""
 
         items = evidence_items or [(kind, payload)]
+        # ids for the Evidence rows THIS writer inserts; a concurrent
+        # winner's ids are returned instead (the idempotent loser path).
         evidence_ids = tuple(f"evidence-{uuid.uuid4().hex[:12]}" for _ in items)
         stamp = _now()
         with self.database.connect() as connection:
+            # Serialize the read-modify-write against every other writer
+            # (claim, open, concurrent completions): the whole
+            # complete-evidence-advance-wake operation is one immediate
+            # transaction, so two workers cannot both complete.
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM core_work_orders WHERE id=?", (order_id,)).fetchone()
             if row is None:
@@ -198,6 +205,15 @@ class WorkOrderRepository:
                 raise RuntimeError(
                     f"work order is declared for agent {row['agent_id']!r}, "
                     f"not {executor_id!r}")
+            if row["status"] == "completed" and _claimant_matches(
+                    row["claimed_by"], executor_id):
+                # A concurrent completion won first (issue #14): this
+                # writer is the idempotent loser — no duplicate
+                # Evidence, no duplicate transition, the winner's ids.
+                existing = [item[0] for item in connection.execute(
+                    "SELECT id FROM core_evidence WHERE work_order_id=? "
+                    "ORDER BY created_at", (order_id,)).fetchall()]
+                return self.get(order_id), tuple(existing)
             if (row["status"] != "claimed"
                     or not _claimant_matches(row["claimed_by"], executor_id)):
                 raise RuntimeError("only the claiming Agent executor can complete a WorkOrder")
@@ -240,9 +256,16 @@ class WorkOrderRepository:
             if is_direct:
                 connection.execute("""UPDATE core_interventions
                     SET status='complete',resolution_outcome='RETURN_TO_GOAL',updated_at=?
-                    WHERE id=?""", (stamp, row["intervention_id"]))
+                    WHERE id=? AND status IN ('running','waiting')""",
+                    (stamp, row["intervention_id"]))
+                # Expected-state CAS (issue #14): only a run that still
+                # owns the ACT stage this completion was opened under may
+                # advance to EVALUATE. A stale completion that arrives
+                # after the run moved on (or a newer run took over the
+                # goal) matches no row and forces nothing.
                 connection.execute("""UPDATE core_runs
-                    SET stage='EVALUATE',status='running',updated_at=? WHERE id=?""",
+                    SET stage='EVALUATE',status='running',updated_at=? WHERE id=?
+                    AND stage='ACT' AND status IN ('running','waiting')""",
                     (stamp, row["run_id"]))
             elif wake_run:
                 connection.execute("""UPDATE core_runs SET status='ready',updated_at=?

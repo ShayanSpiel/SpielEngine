@@ -673,40 +673,52 @@ class TestMemoryBehavior(HarnessCase):
         self.assertNotIn("workflow", [m.scope for m in without_workflow],
                          "workflow memory applies only with its workflow_id")
 
-    def test_sibling_goal_strategy_learning_is_relevant(self):
-        # F7(a) pin: an active strategy claim from a sibling goal — same
-        # owner and same metric — is relevant to THIS goal (sibling-goal
-        # learning), while an unrelated goal's strategy claim is not.
+    def test_same_owner_and_metric_is_not_a_strategy_relation(self):
+        # Issue #7: sharing an owner and a metric is NOT strategy
+        # relevance — two campaigns can carry both while pursuing
+        # materially different strategies. Only explicit structure
+        # (parent/child/supports/shared parent) relates goals.
+        self.new_goal(name="Campaign A", metric="m")
         sibling = self.runtime.create_goal(
-            name="Sibling goal", owner_id="director", metric="m",
-            operator="ge", target=1, config={"aggregation": "latest"})
-        unrelated = self.runtime.create_goal(
-            name="Unrelated goal", owner_id="director", metric="m_other",
-            operator="ge", target=1, config={"aggregation": "latest"})
-        foreign_owner = self.runtime.create_goal(
-            name="Foreign-owner goal", owner_id="seo-owner", metric="m",
+            name="Campaign B", owner_id="director", metric="m",
             operator="ge", target=1, config={"aggregation": "latest"})
         sibling_run = self.runtime.runs.current(sibling["id"])
         sibling_evidence = self.runtime.evidence.record(
             goal_id=sibling["id"], run_id=sibling_run.id, kind="m",
             payload={"m": 1})
         self.runtime.memory.remember(
-            "strategy", "sibling goal learned this already",
+            "strategy", "campaign B learned this already",
             evidence_ids=(sibling_evidence.id,), goal_id=sibling["id"],
             run_id=sibling_run.id)
-        sibling_claims = [item.claim for item in self.runtime.memory.relevant(
+        claims = [item.claim for item in self.runtime.memory.relevant(
             goal_id=self.goal_id, limit=20)]
-        self.assertIn("sibling goal learned this already", sibling_claims,
-                      "strategy claims from a same-owner, same-metric goal "
-                      "reach the sibling's relevant memory")
-        unrelated_claims = [item.claim for item in self.runtime.memory.relevant(
-            goal_id=unrelated["id"], limit=20)]
-        self.assertNotIn("sibling goal learned this already", unrelated_claims,
-                          "a different metric is an unrelated goal")
-        foreign_claims = [item.claim for item in self.runtime.memory.relevant(
-            goal_id=foreign_owner["id"], limit=20)]
-        self.assertNotIn("sibling goal learned this already", foreign_claims,
-                          "a different owner is an unrelated goal")
+        self.assertNotIn("campaign B learned this already", claims,
+                         "same owner + same metric alone must not leak "
+                         "strategy between campaigns")
+
+    def test_shared_parent_sibling_learning_is_relevant(self):
+        # The positive pin (issue #7): genuine siblings — children of the
+        # same parent — DO share strategy learning.
+        parent = self.runtime.create_goal(
+            name="Parent", owner_id="director", metric="parent_metric",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        self.new_goal(name="Focus", metric="m", parent_id=parent["id"])
+        sibling = self.runtime.create_goal(
+            name="Genuine sibling", owner_id="director", metric="m",
+            operator="ge", target=1, parent_id=parent["id"],
+            config={"aggregation": "latest"})
+        sibling_run = self.runtime.runs.current(sibling["id"])
+        evidence = self.runtime.evidence.record(
+            goal_id=sibling["id"], run_id=sibling_run.id, kind="m",
+            payload={"m": 1})
+        self.runtime.memory.remember(
+            "strategy", "genuine sibling learned this",
+            evidence_ids=(evidence.id,), goal_id=sibling["id"],
+            run_id=sibling_run.id)
+        claims = [item.claim for item in self.runtime.memory.relevant(
+            goal_id=self.goal_id, limit=20)]
+        self.assertIn("genuine sibling learned this", claims,
+                     "strategy claims reach genuine (shared-parent) siblings")
 
     def test_strategy_memory_written_by_goal_evaluation_with_evidence(self):
         evidence = self._evidence()
@@ -904,7 +916,15 @@ class TestContextAssembly(HarnessCase):
             prompt="what should I do next?", owner_id="director")
         self.assertIn("what should I do next?", projection["context"])
         self.assertIn("One sale per week", projection["context"])
-        self.assertIn("weekly_sales", projection["context"])
+        # Owner voice: the goal renders with human progress and the
+        # evidence as an outcome sentence; the metric key rides the
+        # Machine reference line at the end, never the human lines.
+        self.assertIn("0 of 1 customers per week", projection["context"])
+        self.assertIn("weekly sales 0", projection["context"])
+        human, _, machine = projection["context"].partition(
+            "Machine reference:")
+        self.assertNotIn("weekly_sales", human)
+        self.assertIn("weekly_sales", machine)
         self.assertIn("owner.pref", projection["context"],
                       "owner memory must be injected into host context")
         self.assertEqual(projection["goal_id"], self.goal_id)
@@ -931,7 +951,12 @@ class TestContextAssembly(HarnessCase):
                                   source="host", payload={"weekly_sales": 1})
         projection = CleanCommandRuntime(self.db, readonly=True).assemble_context(
             prompt="x", owner_id="director")
-        self.assertIn("weekly_sales", projection["context"])
+        # Owner voice: human lines only; the metric key stays in the
+        # Machine reference line the read-only projection also carries.
+        human, _, machine = projection["context"].partition(
+            "Machine reference:")
+        self.assertNotIn("weekly_sales", human)
+        self.assertIn("weekly_sales", machine)
 
     def test_codex_hook_output_shape(self):
         projection = self.runtime.assemble_context(prompt="hi",
@@ -1168,11 +1193,27 @@ class TestNotificationsAndAttention(HarnessCase):
         self.new_goal(metric="m")
 
     def test_ask_user_creates_pending_owner_input_required_notification(self):
+        # Intentional semantic change (issue #5 of goal-d62825bb0b23):
+        # an ordinary DECIDE park for a goal nothing can decide is HOST
+        # reasoning — the Director agent answers it with `goal decide` —
+        # so its notification kind is host_work_required. The structured
+        # four-field ask shape is preserved: message, why, decision,
+        # after, and the required action (the `goal decide` answer).
         self.runtime.tick(max_advances=10)
         pending = self.runtime.notifications(goal_id=self.goal_id)
         self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["kind"], "owner_input_required")
+        self.assertEqual(pending[0]["kind"], "host_work_required")
         self.assertIn("required_user_action", pending[0]["payload"])
+        # Owner voice: the four owner-facing fields carry no CLI answer
+        # syntax; the exact commands ride the payload for the Director,
+        # which records the answer through the CLI itself.
+        self.assertNotIn("company goal decide",
+                         pending[0]["payload"]["after"])
+        self.assertIn("company goal decide",
+                      pending[0]["payload"]["answer_syntax"][
+                          "execute_workflow"])
+        self.assertIn("external actions still park for approval first",
+                      pending[0]["payload"]["after"])
 
     def test_attention_maps_pending_notifications(self):
         self.runtime.tick(max_advances=10)
@@ -2070,15 +2111,16 @@ class TestSingleOwnerRunClaims(unittest.TestCase):
                          (GoalStage.OBSERVE, 2))
 
     def test_parked_act_readvanced_by_both_workers_duplicates_nothing(self):
-        # The AssignmentExecutor parks ACT for the host (ask_user); both
-        # workers then re-advance the parked run. The idempotent CAS plus
-        # the intervention-keyed notification conflict keep every row
+        # The AssignmentExecutor parks ACT as HOST WORK (intentional
+        # semantic change, issue #5 of goal-d62825bb0b23); both workers
+        # then re-advance the parked run. The idempotent CAS plus the
+        # intervention-keyed notification conflict keep every row
         # singular: no duplicate orders, asks, or interventions.
         for engine in (self.engine1, self.engine2):
             engine.resolution.executor = AssignmentExecutor()
         self.engine1.advance(self.goal_id)  # OBSERVE→DECIDE
         self.engine1.advance(self.goal_id)  # DECIDE→ACT
-        parked = self.engine1.advance(self.goal_id)  # ACT parks ask_user
+        parked = self.engine1.advance(self.goal_id)  # ACT parks host work
         self.assertEqual((parked["run"].stage, parked["run"].status),
                          (GoalStage.ACT, "waiting"))
         self.assertEqual(self._counts(),
@@ -2087,9 +2129,16 @@ class TestSingleOwnerRunClaims(unittest.TestCase):
         with self.runtime1.connect() as connection:
             asks = connection.execute(
                 """SELECT COUNT(*) FROM core_notifications
+                   WHERE goal_id=? AND kind='host_work_required'
+                     AND status='pending'""", (self.goal_id,)).fetchone()[0]
+        self.assertEqual(asks, 1, "exactly one host-work ask for the parked run")
+        with self.runtime1.connect() as connection:
+            owner_asks = connection.execute(
+                """SELECT COUNT(*) FROM core_notifications
                    WHERE goal_id=? AND kind='owner_input_required'
                      AND status='pending'""", (self.goal_id,)).fetchone()[0]
-        self.assertEqual(asks, 1, "exactly one owner ask for the parked run")
+        self.assertEqual(owner_asks, 0,
+                         "ordinary parked work never asks the owner")
 
         # Both workers re-advance the parked run: idempotent, no growth.
         self.engine2.advance(self.goal_id)
@@ -2101,7 +2150,7 @@ class TestSingleOwnerRunClaims(unittest.TestCase):
         with self.runtime2.connect() as connection:
             asks = connection.execute(
                 """SELECT COUNT(*) FROM core_notifications
-                   WHERE goal_id=? AND kind='owner_input_required'
+                   WHERE goal_id=? AND kind='host_work_required'
                      AND status='pending'""", (self.goal_id,)).fetchone()[0]
         self.assertEqual(asks, 1, "the parked ask stays singular")
 
@@ -2364,10 +2413,15 @@ class TestCLISurface(unittest.TestCase):
                         "tick parks work for the host and then goes quiet")
 
     def test_notifications_list_json(self):
+        # Intentional semantic change (issue #5 of goal-d62825bb0b23):
+        # an ordinary DECIDE park for a goal nothing can decide is HOST
+        # reasoning — the Director agent answers it with `goal decide` —
+        # so its notification kind is host_work_required, never an
+        # owner ask.
         self.run_cli("runner", "tick", "--json")
         rows = self.run_cli("notifications", "list", "--json")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kind"], "owner_input_required")
+        self.assertEqual(rows[0]["kind"], "host_work_required")
 
     def test_tasks_complete_by_agent_id_documented_flow_succeeds(self):
         # D1 fixed (inverted pin): the documented host flow completes an

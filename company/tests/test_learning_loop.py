@@ -494,8 +494,13 @@ class TestStrategyTopology(LearningLoopCase):
                          "goal's claims")
 
     def test_own_and_sibling_claims_still_reach(self):
-        # The F7 sibling join (same owner+metric) and the goal's own
-        # claims stay intact on top of the new topology joins.
+        # Intentional semantic change (issue #7 of goal-d62825bb0b23):
+        # the goal's OWN claims still reach it, but same-owner+metric is
+        # NO LONGER a strategy relation — two campaigns can share both
+        # while pursuing materially different strategies. Only explicit
+        # structure (parent/child/supports/shared parent) joins goals;
+        # the positive pins live above and in test_harness_behavior
+        # (test_shared_parent_sibling_learning_is_relevant).
         sibling = self.runtime.create_goal(
             name="Sibling", owner_id="director", metric="m",
             operator="ge", target=1, config={"aggregation": "latest"})
@@ -504,9 +509,9 @@ class TestStrategyTopology(LearningLoopCase):
         claims = self._relevant_claims(self.goal_id)
         self.assertIn("focus goal learned this", claims,
                       "the goal's own claims still reach it")
-        self.assertIn("sibling learned this", claims,
-                      "sibling-goal learning (same owner+metric) is "
-                      "preserved")
+        self.assertNotIn("sibling learned this", claims,
+                         "same owner+metric alone is not a strategy "
+                         "relation; unrelated goals learn separately")
 
     def test_blocks_edges_do_not_reach(self):
         # Topology relevance is supports-only: a blocking relationship
@@ -663,17 +668,52 @@ class TestRepetitionSignal(LearningLoopCase):
                           "two similar orders do not surface a signal")
 
     def test_different_instructions_do_not_group(self):
-        # The simplest defensible similarity: same goal, same agent,
-        # same instruction (whitespace-normalized). Different
-        # instructions are different work.
+        # Intentional semantic change (issue #3 of goal-d62825bb0b23):
+        # the repetition shape is now the EXECUTION pattern — same goal,
+        # same agent, same evidence kind, same payload-key signature —
+        # so materially equivalent work groups even when each instruction
+        # is worded differently (that is the semantic repetition DECIDE
+        # crystallizes a Workflow from). The pin is inverted: three
+        # differently-worded instructions over the same execution shape
+        # DO surface. What must NOT group is unrelated work — a
+        # different evidence kind — pinned right below.
         self.new_goal(name="Varied", metric="weekly_sales")
         for index in range(3):
             self._complete_similar_order(
                 instruction=f"close deal number {index}")
         board = self.runtime.observe()
+        entries = [item for item in board["repetition"]
+                   if item["goal_id"] == self.goal_id]
+        self.assertEqual(len(entries), 1,
+                         "differently-worded instructions over the same "
+                         "execution shape are materially equivalent work")
+        self.assertEqual(entries[0]["completed_orders"], 3)
+
+    def test_unrelated_orders_do_not_group(self):
+        # The exclusion side of the intentional change (issue #3): three
+        # orders with different evidence kinds are unrelated work — no
+        # shared execution shape, no repetition entry.
+        self.new_goal(name="Unrelated", metric="weekly_sales")
+        for index in range(3):
+            self.tick_until(lambda: (self.current_run().stage
+                                     == GoalStage.DECIDE
+                                     and self.current_run().status
+                                     == "waiting"))
+            self.runtime.decide_goal(
+                self.goal_id, "request_agent", agent="director",
+                instruction=f"unrelated task {index}",
+                evidence_kind=f"unrelated_{index}")
+            order = self.active_orders()[0]
+            self.runtime.claim_work_order(order["id"], "director")
+            self.runtime.complete_work_order(
+                order["id"], "director",
+                [{"kind": f"unrelated_{index}",
+                  "payload": {"weekly_sales": 0}}])
+        board = self.runtime.observe()
         self.assertEqual([item for item in board["repetition"]
                           if item["goal_id"] == self.goal_id], [],
-                          "three different instructions are not repetition")
+                          "three unrelated orders (different evidence "
+                          "kinds) are not repetition")
 
     def test_repetition_is_bounded(self):
         # At most five entries surface, whatever the history holds.

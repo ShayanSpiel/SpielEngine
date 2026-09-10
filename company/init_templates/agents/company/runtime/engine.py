@@ -26,6 +26,116 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ---------------------------------------------------------------------------
+# Owner voice (goal-director-voice): every owner-facing text speaks owner
+# language — goals by name with human progress, evidence as outcome
+# sentences, loop position in plain words, and named options instead of
+# decision enums. Raw ids, metric keys, stage/status enums, payloads, and
+# CLI answer syntax never enter owner-facing text: they ride the payload
+# machine fields (and the projection's Machine reference line) for the
+# Director alone.
+# ---------------------------------------------------------------------------
+
+#: Human glosses for the metric keys the runtime itself names; every
+#: other metric renders as plain numbers (value of target) with no key.
+METRIC_GLOSSES = {
+    "weekly_sales": "customers per week",
+}
+
+
+def _human_words(value) -> str:
+    """An underscored identifier as plain owner words."""
+    return str(value).replace("_", " ")
+
+
+def human_progress(metric, value, target) -> str:
+    """Where a goal stands, in owner words: the value against the target —
+    never the metric key, the operator, or a goal id. Plain numbers when
+    the metric carries no human gloss."""
+    if value is None:
+        return "no reading yet"
+    if isinstance(value, bool):
+        return "achieved" if value else "not yet achieved"
+    gloss = METRIC_GLOSSES.get(metric)
+    if gloss:
+        return f"{value} of {target} {gloss}"
+    return f"{value} of {target}"
+
+
+def _stage_doing(stage) -> str:
+    """What a run is doing at one stage of the loop, in owner words."""
+    return {"OBSERVE": "reviewing the evidence",
+            "DECIDE": "choosing the next move",
+            "ACT": "running the bounded work",
+            "EVALUATE": "checking the result"}.get(
+                str(stage), "advancing the goal")
+
+
+def human_loop_position(stage, status) -> str:
+    """Where a run stands in the loop, in owner words — never the
+    stage/status enums."""
+    if str(status) == "waiting":
+        return f"parked while {_stage_doing(stage)}"
+    return f"next step: {_stage_doing(stage)}"
+
+
+def human_stage_doing(stage) -> str:
+    """The owner-words name of one loop stage (RUNTIME_FAILURE_MESSAGE)."""
+    return _stage_doing(stage)
+
+
+def human_goal_status(status) -> str:
+    """A goal status in owner words."""
+    return {"active": "in progress", "complete": "achieved",
+            "paused": "paused", "abandoned": "dropped"}.get(
+                str(status), _human_words(status))
+
+
+def human_decision(kind) -> str:
+    """A decision kind in owner words."""
+    return {"execute_workflow": "ran a candidate workflow",
+            "request_agent": "assigned bounded direct work",
+            "evaluate": "checked the result",
+            "decision_request": "parked for a decision"}.get(
+                str(kind), _human_words(kind))
+
+
+def human_resolution(outcome) -> str:
+    """A resolution outcome in owner words."""
+    return {"RETURN_TO_GOAL": "finished",
+            "ESCALATE_TO_GOAL": "escalated back to the goal",
+            "HOST_WORK": "parked as host work",
+            "ASK_USER": "waiting on the owner",
+            "CONTINUE_LOCAL": "kept fixing locally",
+            "SYSTEM_DEFECT": "opened a repair"}.get(
+                str(outcome), _human_words(outcome))
+
+
+def human_attention(kind) -> str:
+    """A notification kind in owner words."""
+    return {"owner_input_required": "waiting on you",
+            "host_work_required": "in progress with its agent"}.get(
+                str(kind), _human_words(kind))
+
+
+def human_outcome(kind, payload) -> str:
+    """One evidence item as an owner-voice outcome sentence — its own
+    numbers in plain words, never a kind=json dump. The runtime's
+    bookkeeping keys stay out of the sentence."""
+    parts = [f"{_human_words(key)} {value}"
+             for key, value in sorted((payload or {}).items())
+             if key not in ("source", "validity")]
+    if parts:
+        return ", ".join(parts)
+    return _human_words(kind)
+
+
+def _workflow_label(workflow_id) -> str:
+    """The owner-voice label of a workflow id: its own name, last
+    segment, underscores as spaces."""
+    return _human_words(str(workflow_id).rsplit(":", 1)[-1]) or "workflow"
+
+
 # After this many consecutive ESCALATE_TO_GOAL outcomes the goal parks for
 # the owner instead of churning another run (a deterministic controller
 # that re-decides the same failing intervention would otherwise livelock).
@@ -38,57 +148,118 @@ ESCALATION_PARK_MESSAGE = (
 # The DECIDE intelligence boundary: a goal the runtime cannot decide for the
 # owner parks a decision_request instead of inventing bounded work.
 DECIDE_REQUEST_DECISION = (
-    "Choose the next bounded intervention: execute a candidate workflow or "
-    "assign bounded direct work with a concrete instruction and evidence kind.")
+    "Choose the next bounded step: run one of the candidate workflows, or "
+    "assign bounded direct work with a concrete instruction.")
 DECIDE_REQUEST_AFTER = (
-    "Answer with: company goal decide {goal_id} --kind execute_workflow "
-    "--workflow <id>  |  --kind request_agent --agent <id> --instruction "
-    '"<bounded instruction>" --evidence-kind <kind>. The run then executes '
-    "it; external actions still park for approval first.")
+    "Answer in your own words and the Director records it; the run then "
+    "executes the chosen step, and external actions still park for "
+    "approval first.")
 
 # The stall boundary: a goal whose evaluated metric stops moving while
 # DECIDE keeps making the identical decision parks for the owner instead
 # of chaining identical runs forever.
 STALL_PARK_MESSAGE = (
-    "Goal '{name}' has stopped moving: {metric} held at {value} across "
-    "{count} evaluated runs that all made the same decision. Continue, "
-    "adjust, or leave parked.")
+    "Goal '{name}' has stopped moving: {progress} across {count} evaluated "
+    "runs that all made the same decision. Continue, adjust, or leave "
+    "parked.")
 REVIEW_PARK_MESSAGE = (
-    "Goal '{name}' reached its owner review checkpoint at run {sequence} "
-    "(review_every={interval}). Continue, adjust, or leave parked.")
-PARK_DECISION = ("Continue as-is, change the goal (metric/target/approach), "
-                 "or pause it.")
-PARK_AFTER = ("company goal resume {goal_id} opens the next run now; leaving "
-              "it parked holds the goal.")
+    "Goal '{name}' reached its owner review checkpoint at run {sequence} — "
+    "the owner asked to look at it every {interval} runs. Continue, adjust, "
+    "or leave parked.")
+PARK_DECISION = "Continue as-is, change the goal, or pause it."
+PARK_AFTER = ("Say continue and the Director opens the next run now; "
+              "leaving it parked holds the goal.")
 
 # The F1 failure boundary: a goal whose stage raises parks with durable
 # runtime_failure evidence and one owner ask instead of aborting the
 # scheduler tick or crash-looping the background watcher.
 RUNTIME_FAILURE_MESSAGE = (
-    "Goal '{name}' run {sequence} failed at stage {stage}: {error_type}: "
-    "{error}. The run is parked so sibling goals keep advancing.")
+    "Goal '{name}' run {sequence} failed while {doing}: {error}. The run "
+    "is parked so sibling goals keep advancing.")
 RUNTIME_FAILURE_DECISION = (
-    "Fix the failing controller, Department, or executor and resume the "
-    "goal, or pause it")
+    "Fix what failed and let the run continue, or pause the goal")
+
+# Host dispatch (separate HOST WORK from OWNER INPUT): a parked
+# WorkOrder is work its assigned host-side Agent executes — never an
+# owner ask. The owner sees normal execution language; internals stay
+# out of it unless they ask for debugging.
+HOST_WORK_MESSAGE = (
+    "Working on '{name}': step '{step}' is with Agent {agent}.")
+
+# The self-repair boundary: one classified structural defect opens a
+# bounded system-improvement Goal immediately — never a second identical
+# broken execution — and the original goal resumes automatically once
+# the repair carries acceptance evidence.
+DEFECT_REPAIR_MESSAGE = (
+    "The '{workflow}' step '{step}' had a {kind} defect. Fixed it and "
+    "resumed '{goal}'.")
 
 # The fixable-churn boundary (F5): an executor that keeps marking the same
 # intervention fixable exhausts its local budget over and over; after
 # ESCALATION_PARK_THRESHOLD consecutive exhaustions the run parks for the
 # owner instead of churning the identical fix loop.
 FIXABLE_PARK_MESSAGE = (
-    "Goal '{name}' is stuck in the same local fix loop: intervention "
-    "'{description}' exhausted its local retry budget {threshold} times in "
-    "a row without completing. Change the executor's approach or pause "
-    "the goal.")
+    "Goal '{name}' is stuck in the same local fix loop: '{description}' "
+    "exhausted its local retry budget {threshold} times in a row without "
+    "completing. Change how this work runs, or pause the goal.")
 FIXABLE_PARK_DECISION = (
-    "Fix the executor so the step can complete, or pause the goal")
+    "Fix how this work runs so the step can complete, or pause the goal")
 
 
-def _owner_ask(message: str, why: str, decision: str, after: str) -> dict:
+def _owner_ask(message: str, why: str, decision: str, after: str, *,
+               goal=None, machine: dict | None = None,
+               answer_syntax=None) -> dict:
     """The one owner-ask shape: what is needed, why now, what decision the
-    owner must make, and what happens after they answer."""
-    return {"message": message, "why": why, "decision": decision,
-            "after": after, "required_user_action": message}
+    owner must make, and what happens after they answer.
+
+    The owner-facing four fields carry no ids, metric keys, enums, or CLI
+    answer syntax. Those ride the payload instead — the goal subject the
+    host renderers narrate (``goal.name``), the ``machine`` ids/enums, and
+    the ``answer_syntax`` the Director records the owner's answer with.
+    """
+    payload = {"message": message, "why": why, "decision": decision,
+               "after": after, "required_user_action": message}
+    if goal is not None:
+        payload["goal"] = {"id": goal.id, "name": goal.name}
+    if machine:
+        payload["machine"] = machine
+    if answer_syntax:
+        payload["answer_syntax"] = answer_syntax
+    return payload
+
+
+def _host_work_ask(goal, message: str, intervention=None, *,
+                   repair: bool = False) -> dict:
+    """The host-dispatch payload shape (issue #5).
+
+    A parked WorkOrder is HOST WORK: the assigned Agent — a host-side
+    persona such as the Director or an installed worker — executes it,
+    and the owner is not interrupted. The payload keeps the same
+    four-field shape (the host renders it if the owner asks), but the
+    addressee is the agent, the decision is execution, and the message
+    stays in owner-facing execution language.
+    """
+    agent = (intervention and _intervention_agent(intervention)
+             or goal.owner_id)
+    return {
+        "message": message,
+        "why": (f"a step of '{goal.name}' is ready for its assigned "
+                "Agent; this is host work, not an owner decision"),
+        "decision": (f"Execute the parked work order for Agent {agent} "
+                     "and complete it with its declared evidence"),
+        "after": ("the run continues automatically; live external "
+                  "actions still park for approval first"),
+        "repair": repair,
+        "required_user_action": None,
+        "goal": {"id": goal.id, "name": goal.name},
+        "machine": {"goal_id": goal.id, "agent": agent,
+                    "repair": repair},
+    }
+
+
+def _intervention_agent(intervention) -> str | None:
+    return ((intervention.context or {}).get("agent_id")
+            if intervention is not None else None)
 
 
 def _encode(value):
@@ -149,6 +320,9 @@ class Evaluation:
     metrics: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
     strategy_learning: str | None = None
+    #: The approach (workflow id) a strategy lesson is about, so the
+    #: persisted memory row links the lesson to the candidate it judges.
+    strategy_workflow_id: str | None = None
     evidence_ids: tuple[str, ...] = ()
 
 
@@ -344,7 +518,7 @@ class GoalRuntime:
             # Decision declares becomes durable HERE — the same moment the
             # Intervention does. `goal decide` adoption writes the same
             # row for owner-answered decisions.
-            self._persist_declared_workflow(run.decision)
+            self._persist_declared_workflow(run.decision, goal, run.id)
             intervention = self.interventions.active_for_run(run.id)
             if intervention is None:
                 intervention_context = dict(run.decision.context)
@@ -393,16 +567,20 @@ class GoalRuntime:
             payload={"error": str(exc), "error_type": type(exc).__name__})
         payload = _owner_ask(
             message=RUNTIME_FAILURE_MESSAGE.format(
-                name=goal.name, sequence=run.sequence, stage=run.stage.value,
-                error_type=type(exc).__name__, error=str(exc)),
-            why=(f"the {run.stage.value} stage of run {run.sequence} raised "
-                 f"{type(exc).__name__} while the run was scheduled; parking "
-                 "it keeps the scheduler and every sibling goal advancing "
-                 "instead of crash-looping on the same failure"),
+                name=goal.name, sequence=run.sequence,
+                doing=human_stage_doing(run.stage.value), error=str(exc)),
+            why=(f"run {run.sequence} of '{goal.name}' failed while "
+                 f"{human_stage_doing(run.stage.value)} and was parked; "
+                 "parking it keeps the scheduler and every sibling goal "
+                 "advancing instead of crash-looping on the same failure"),
             decision=RUNTIME_FAILURE_DECISION,
-            after=(f"company goal resume {goal.id} reopens the run once the "
-                   "failure is fixed; the runtime_failure evidence keeps "
-                   "the error inspectable"))
+            after=("once it is fixed the Director reopens the run; the "
+                   "recorded failure keeps the error inspectable"),
+            goal=goal,
+            machine={"goal_id": goal.id, "run_id": run.id,
+                     "stage": run.stage.value, "status": "waiting",
+                     "error_type": type(exc).__name__},
+            answer_syntax={"resume": f"company goal resume {goal.id}"})
         self.runs.update(run.id, status="waiting")
         with self.database.connect() as connection:
             parked = connection.execute("""SELECT COUNT(*) FROM core_notifications
@@ -417,7 +595,8 @@ class GoalRuntime:
                      "owner_input_required", json.dumps(payload), stamp))
         return self.status(goal.id)
 
-    def _persist_declared_workflow(self, decision: Decision) -> None:
+    def _persist_declared_workflow(self, decision: Decision, goal: Goal,
+                                    run_id: str) -> None:
         """Persist the Workflow definition a DECIDE Decision carries (F6).
 
         ``decide()`` never writes: the controller chooses a candidate and
@@ -428,6 +607,10 @@ class GoalRuntime:
         as a no-op (or bumps its version when the declaration changed).
         """
         declared = (decision.context or {}).get("workflow")
+        if decision.context is not None:
+            decision.context["goal_id"] = goal.id
+            decision.context["run_id"] = run_id
+        crystallized = (decision.context or {}).get("crystallized")
         if (decision.kind != "execute_workflow" or not decision.workflow_id
                 or not isinstance(declared, dict)):
             return
@@ -436,6 +619,27 @@ class GoalRuntime:
         self.resolution.workflows.save(Workflow(
             decision.workflow_id, declared.get("name") or decision.workflow_id,
             steps, declared.get("department_id"), declared.get("version") or 1))
+        if crystallized:
+            # Provenance (issue #3): the provenance Evidence row and the
+            # workflow-scope formation claim explain WHY this Workflow
+            # exists — which repeated executions formed it — grounded in
+            # this run so the causal chain stays reconstructable.
+            evidence = self.evidence.record(
+                goal_id=goal.id, run_id=run_id,
+                kind="workflow_crystallized",
+                payload={"workflow_id": decision.workflow_id,
+                         "from_orders": crystallized.get("from_orders") or [],
+                         "shape": crystallized.get("shape") or {},
+                         "reason": crystallized.get("reason") or ""})
+            if run_id:
+                self.memory.remember(
+                    "workflow",
+                    f"{decision.workflow_id} formed from "
+                    f"{len(crystallized.get('from_orders') or [])} materially "
+                    f"equivalent direct executions: "
+                    f"{crystallized.get('reason')}",
+                    evidence_ids=(evidence.id,), goal_id=goal.id,
+                    run_id=run_id, workflow_id=decision.workflow_id)
 
     def _commit_resolution(self, goal: Goal, run: GoalRun, result) -> None:
         stamp = _now()
@@ -465,13 +669,39 @@ class GoalRuntime:
                         "waiting", GoalStage.ACT, "waiting")
             elif result.outcome == ResolutionOutcome.ASK_USER:
                 intervention_status, stage, run_status = "waiting", GoalStage.ACT, "waiting"
+            elif result.outcome == ResolutionOutcome.HOST_WORK:
+                # Host dispatch (issue #5): the assigned Agent executes
+                # this work; the run parks waiting exactly like an ask,
+                # but the notification is host work, never an owner ask.
+                intervention_status, stage, run_status = "waiting", GoalStage.ACT, "waiting"
+            elif result.outcome == ResolutionOutcome.SYSTEM_DEFECT:
+                # Structural self-repair (issue #4): the defecting
+                # intervention is closed for good (its decision declared
+                # the broken shape) while the bounded system-improvement
+                # Goal repairs; the resumed run re-decides against the
+                # repaired definition through a fresh intervention.
+                intervention_status, stage, run_status = (
+                    "escalated", GoalStage.ACT, "waiting")
             else:
                 intervention_status, stage, run_status = "escalated", GoalStage.ACT, "complete"
             # F2: the stage/status read when this advance began are the
             # claim on the run. Losing this compare-and-swap means another
             # worker already advanced it, so this writer commits nothing
             # further for the run.
-            if result.outcome == ResolutionOutcome.ESCALATE_TO_GOAL:
+            if result.outcome == ResolutionOutcome.SYSTEM_DEFECT:
+                # Open the bounded system-improvement Goal for this
+                # defect INSIDE the same transaction that parks the run,
+                # then mark the defective workflow run superseded so the
+                # resumed intervention re-executes against the repaired
+                # definition instead of its broken snapshot.
+                self._open_defect_repair(connection, goal, run,
+                                         result.intervention, result.defect)
+                claimed = connection.execute(
+                    """UPDATE core_runs SET stage=?,status='waiting',updated_at=?
+                       WHERE id=? AND stage=? AND status=?""",
+                    (GoalStage.ACT.value, stamp, run.id,
+                     run.stage.value, run.status)).rowcount
+            elif result.outcome == ResolutionOutcome.ESCALATE_TO_GOAL:
                 consecutive = self._consecutive_escalations(
                     connection, goal.id, run.sequence) + 1
                 if consecutive >= ESCALATION_PARK_THRESHOLD:
@@ -515,8 +745,13 @@ class GoalRuntime:
                              "would repeat the failure forever"),
                         decision=("Change the approach, supply the missing "
                                   "context, or pause the goal"),
-                        after=(f"company goal resume {goal.id} opens the next "
-                               "run now; leaving it parked holds the goal"))
+                        after=PARK_AFTER,
+                        goal=goal,
+                        machine={"goal_id": goal.id, "run_id": run.id,
+                                 "stage": run.stage.value,
+                                 "status": "waiting",
+                                 "escalations": ESCALATION_PARK_THRESHOLD},
+                        answer_syntax={"resume": f"company goal resume {goal.id}"})
                     connection.execute("""INSERT INTO core_notifications
                         (id,goal_id,run_id,intervention_id,kind,payload_json,status,
                          created_at,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,NULL)
@@ -540,6 +775,48 @@ class GoalRuntime:
                     (f"notification-{uuid.uuid4().hex[:12]}", goal.id, run.id,
                      result.intervention.id, "owner_input_required",
                      json.dumps(payload), "pending", stamp))
+            elif result.outcome == ResolutionOutcome.HOST_WORK:
+                # Host dispatch (issue #5): one host_work notification —
+                # the assigned Agent (a host-side persona) executes the
+                # parked order. The payload keeps the structured
+                # what/why/decision/after shape for the host, rendered in
+                # owner-facing execution language, and the owner is never
+                # the addressee.
+                payload = _host_work_ask(
+                    goal=goal, message=result.message,
+                    intervention=result.intervention)
+                connection.execute("""INSERT INTO core_notifications
+                    (id,goal_id,run_id,intervention_id,kind,payload_json,status,
+                     created_at,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,NULL)
+                    ON CONFLICT(intervention_id,kind) DO UPDATE SET
+                      payload_json=excluded.payload_json,status='pending',
+                      acknowledged_at=NULL""",
+                    (f"notification-{uuid.uuid4().hex[:12]}", goal.id, run.id,
+                     result.intervention.id, "host_work_required",
+                     json.dumps(payload), "pending", stamp))
+            elif result.outcome == ResolutionOutcome.SYSTEM_DEFECT:
+                # Structural self-repair: one host_work notification in
+                # owner-facing language. The repair goal's execution and
+                # the automatic resume are runtime mechanics — the owner
+                # is not asked to notice, restart, or approve them.
+                payload = _host_work_ask(
+                    goal=goal, message=DEFECT_REPAIR_MESSAGE.format(
+                        workflow=_workflow_label(
+                            result.defect.workflow_id or "workflow"),
+                        step=_human_words(result.defect.step_id or "step"),
+                        kind=result.defect.kind.replace("_", " "),
+                        goal=goal.name),
+                    intervention=result.intervention,
+                    repair=True)
+                connection.execute("""INSERT INTO core_notifications
+                    (id,goal_id,run_id,intervention_id,kind,payload_json,status,
+                     created_at,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,NULL)
+                    ON CONFLICT(intervention_id,kind) DO UPDATE SET
+                      payload_json=excluded.payload_json,status='pending',
+                      acknowledged_at=NULL""",
+                    (f"notification-{uuid.uuid4().hex[:12]}", goal.id, run.id,
+                     result.intervention.id, "host_work_required",
+                     json.dumps(payload), "pending", stamp))
             elif (result.outcome == ResolutionOutcome.CONTINUE_LOCAL
                     and intervention_status == "waiting"):
                 # F5: the fixable-churn park — one owner ask naming the
@@ -555,9 +832,14 @@ class GoalRuntime:
                          "exhaustions of the same intervention the runtime "
                          "parks instead of churning the identical loop"),
                     decision=FIXABLE_PARK_DECISION,
-                    after=(f"company goal resume {goal.id} reopens the run "
-                           "once the loop is addressed; every exhaustion "
-                           "keeps its resolution_iteration evidence"))
+                    after=("once the loop is addressed the Director reopens "
+                           "the run; every retry keeps its evidence"),
+                    goal=goal,
+                    machine={"goal_id": goal.id, "run_id": run.id,
+                             "stage": run.stage.value, "status": "waiting",
+                             "intervention_id": result.intervention.id,
+                             "exhaustions": ESCALATION_PARK_THRESHOLD},
+                    answer_syntax={"resume": f"company goal resume {goal.id}"})
                 connection.execute("""INSERT INTO core_notifications
                     (id,goal_id,run_id,intervention_id,kind,payload_json,status,
                      created_at,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,NULL)
@@ -567,6 +849,141 @@ class GoalRuntime:
                     (f"notification-{uuid.uuid4().hex[:12]}", goal.id, run.id,
                      result.intervention.id, "owner_input_required",
                      json.dumps(payload), "pending", stamp))
+
+    def _open_defect_repair(self, connection, goal: Goal, run: GoalRun,
+                             intervention, defect) -> None:
+        """Open the bounded system-improvement Goal for one structural
+        defect, inside the transaction that parks the defective run.
+
+        The repair Goal is created complete-with-initial-run, carries
+        the exact defect (kind, summary, workflow, step, allowed shape)
+        in its config, is linked to the original goal through a
+        ``blocks`` edge (the original stays parked until the repair
+        completes), and its DECIDE assigns the repair to the
+        system-improvement Agent when one is installed. The original
+        run is resumed automatically when the repair goal completes with
+        acceptance evidence (``_commit_evaluation``), so the owner never
+        has to notice the repair finished.
+        """
+        # Convergence guard (one repair per defect): a repeat defect
+        # after a COMPLETED repair means the fix did not take — parking
+        # as a runtime failure is the genuine owner boundary, never a
+        # second repair goal. An INCOMPLETE repair for the same contract
+        # already owns this defect: park the run, open nothing, and that
+        # repair's completion wakes the run.
+        stamp = _now()
+        prior = connection.execute(
+            """SELECT g.id, g.status FROM core_goals g
+               JOIN core_goal_metadata m ON m.goal_id=g.id
+               WHERE json_extract(m.config_json,'$.repair.workflow_id')=?
+                 AND json_extract(m.config_json,'$.repair.step_id')=?
+                 AND json_extract(m.config_json,'$.repair.blocked_goal_id')=?""",
+            (defect.workflow_id, defect.step_id, goal.id)).fetchall()
+        if prior:
+            if all(row[1] == "complete" for row in prior):
+                self._park_unconverged_defect(
+                    connection, goal, run, intervention, defect)
+            if intervention is not None:
+                connection.execute("""UPDATE core_workflow_runs
+                    SET status='superseded',updated_at=?
+                    WHERE intervention_id=? AND status IN ('running','waiting')""",
+                    (stamp, intervention.id))
+            return
+        repair_goal_id = f"goal-{uuid.uuid4().hex[:12]}"
+        repair_config = {
+            "repair": {
+                "defect_kind": defect.kind,
+                "summary": defect.summary,
+                "workflow_id": defect.workflow_id,
+                "step_id": defect.step_id,
+                "blocked_goal_id": goal.id,
+            },
+            "allowed_files": [],  # bounded by the system-improvement Agent
+            "acceptance": ("behavioral acceptance evidence proving the "
+                           "repaired behavior, payload key "
+                           "'acceptance_green': true"),
+        }
+        repair_name = (f"Repair {defect.kind.replace('_', ' ')} defect in "
+                       f"{defect.workflow_id or 'the runtime'}")
+        connection.execute(
+            "INSERT INTO core_goals VALUES (?,?,?,?,?,?,?,?,?)",
+            (repair_goal_id, repair_name, "acceptance_green", "ge", "1",
+             None, "active", stamp, stamp))
+        connection.execute(
+            "INSERT INTO core_goal_metadata VALUES (?,?,?,?)",
+            (repair_goal_id, self._repair_agent(), None,
+             json.dumps(repair_config)))
+        connection.execute(
+            "INSERT INTO core_runs VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (f"run-{uuid.uuid4().hex[:12]}", repair_goal_id, 1,
+             GoalStage.OBSERVE.value, "ready", None, None, None, stamp, stamp))
+        # The repair blocks the original goal until it completes; the
+        # parked waiting run stays owned by the defecting intervention.
+        connection.execute(
+            "INSERT OR IGNORE INTO core_goal_edges VALUES (?,?,?,?)",
+            (repair_goal_id, goal.id, "blocks", stamp))
+        # The defective WorkflowRun is superseded: the resumed run starts
+        # a fresh WorkflowRun from the repaired definition instead of
+        # continuing the broken snapshot.
+        if intervention is not None:
+            connection.execute("""UPDATE core_workflow_runs
+                SET status='superseded',updated_at=?
+                WHERE intervention_id=? AND status IN ('running','waiting')""",
+                (stamp, intervention.id))
+
+    def _park_unconverged_defect(self, connection, goal: Goal, run: GoalRun,
+                                 intervention, defect) -> None:
+        """Park a run whose step re-defects after a completed repair.
+
+        The repair already ran with acceptance evidence and the same
+        behavior still breaks: that is a runtime failure the owner must
+        see, not another repair goal. Durable ``system_defect`` evidence
+        records the repeat defect and one pending ``owner_input_required``
+        ask (what/why/decision/after) carries it; the run is parked
+        waiting by the caller, so the scheduler stops rescheduling it.
+        """
+        connection.execute(
+            "INSERT INTO core_evidence VALUES (?,?,?,?,?,?,?,?,?)",
+            (f"evidence-{uuid.uuid4().hex[:12]}", goal.id, run.id,
+             intervention.id if intervention is not None else None, None,
+             None, "system_defect",
+             json.dumps({"defect_kind": defect.kind,
+                         "summary": defect.summary,
+                         "workflow_id": defect.workflow_id,
+                         "step_id": defect.step_id,
+                         "repeat_after_repair": True}),
+             _now()))
+        payload = _owner_ask(
+            message=(f"The '{_workflow_label(defect.workflow_id or 'workflow')}' "
+                     f"step '{_human_words(defect.step_id or 'step')}' broke "
+                     f"again after its repair had already been completed and "
+                     f"accepted on '{goal.name}'"),
+            why=(f"a completed repair with acceptance evidence exists for "
+                 f"this defect and the same behavior still fails — opening "
+                 f"another identical repair would repeat forever"),
+            decision=("Fix what keeps breaking it and let the run continue, "
+                      "or pause the goal"),
+            after=("once it is fixed the Director reopens the run; the "
+                   "recorded repeat defect keeps the evidence inspectable"),
+            goal=goal,
+            machine={"goal_id": goal.id, "run_id": run.id,
+                     "stage": GoalStage.ACT.value, "status": "waiting",
+                     "workflow_id": defect.workflow_id,
+                     "step_id": defect.step_id,
+                     "repeat_defect": True},
+            answer_syntax={"resume": f"company goal resume {goal.id}"})
+        connection.execute("""INSERT INTO core_notifications
+            (id,goal_id,run_id,intervention_id,kind,payload_json,status,
+             created_at,acknowledged_at) VALUES (?,?,?,?,?,?,?,?,NULL)""",
+            (f"notification-{uuid.uuid4().hex[:12]}", goal.id, run.id,
+             intervention.id if intervention is not None else None,
+             "owner_input_required", json.dumps(payload), "pending", _now()))
+
+    def _repair_agent(self) -> str:
+        """The owner id the repair goal routes to: the installed
+        system-improvement Agent when present, else the Director."""
+        return ("system-improvement" if "system-improvement" in
+                (self.resolution.agents or {}) else "director")
 
     def _park_decision_request(self, goal: Goal, run: GoalRun,
                                decision: Decision) -> None:
@@ -578,33 +995,54 @@ class GoalRuntime:
                                decision=decision)
         if (park.stage, park.status) != (GoalStage.DECIDE, "waiting"):
             return  # another worker owns this run
+        boundary = (decision.context or {}).get("owner_boundary") or "undecided"
         request = dict((decision.context or {}).get("decision_request") or {})
         digest = request.get("evidence") or []
-        evidence_line = "; ".join(
-            f"{item.get('kind', '?')} ({', '.join(item.get('payload_keys') or [])})"
-            for item in digest) or "none recorded"
+        tried = "; ".join(
+            str(item.get("outcome") or item.get("kind") or "?")
+            for item in digest) or "nothing recorded yet"
         runs_count = len(request.get("recent_runs") or [])
+        progress = human_progress(goal.metric,
+                                  request.get("observation_value"),
+                                  goal.target)
         payload = _owner_ask(
             message=decision.description,
-            why=(f"{goal.metric} stands at "
-                 f"{request.get('observation_value', 'no value')} against "
-                 f"{goal.operator} {json.dumps(goal.target)}; latest "
-                 f"evidence: {evidence_line}; {runs_count} run(s) so far. "
-                 "No Department can decide the next bounded step on the "
-                 "owner's behalf."),
+            why=(f"'{goal.name}' stands at {progress}; what we have tried "
+                 f"so far: {tried}. {runs_count} run(s) so far. "
+                 + ("Every candidate approach has been tried and judged on "
+                    "this goal — changing the strategy is an owner-level "
+                    "material choice."
+                    if boundary == "exhausted" else
+                    "No Department can decide the next bounded step on the "
+                    "owner's behalf.")),
             decision=DECIDE_REQUEST_DECISION,
-            after=DECIDE_REQUEST_AFTER.format(goal_id=goal.id))
+            after=DECIDE_REQUEST_AFTER,
+            goal=goal,
+            machine={"goal_id": goal.id, "run_id": run.id,
+                     "stage": run.stage.value, "status": run.status,
+                     "metric": goal.metric, "operator": goal.operator,
+                     "target": goal.target, "boundary": boundary},
+            answer_syntax=request.get("answer_syntax"))
+        # The park's addressee (issue #1/#5): an EXHAUSTED park is a
+        # genuine owner boundary — the owner must change the approach.
+        # An UNDECIDED park is HOST reasoning: the Director agent reads
+        # the same structured ask and answers with `goal decide`, and
+        # only relays to the owner when owner-only context or authority
+        # is genuinely required. The owner is never the default
+        # GoalController.
+        kind = ("owner_input_required" if boundary == "exhausted"
+                else "host_work_required")
         with self.database.connect() as connection:
             parked = connection.execute("""SELECT COUNT(*) FROM core_notifications
                 WHERE run_id=? AND intervention_id IS NULL
-                  AND kind='owner_input_required' AND status='pending'""",
-                (run.id,)).fetchone()[0]
+                  AND kind=? AND status='pending'""",
+                (run.id, kind)).fetchone()[0]
             if not parked:
                 connection.execute("""INSERT INTO core_notifications
                     (id,goal_id,run_id,intervention_id,kind,payload_json,status,
                      created_at,acknowledged_at) VALUES (?,?,?,?,?,?,'pending',?,NULL)""",
                     (f"notification-{uuid.uuid4().hex[:12]}", goal.id, run.id, None,
-                     "owner_input_required", json.dumps(payload), stamp))
+                     kind, json.dumps(payload), stamp))
 
     def _ask_memory_line(self, goal: Goal, intervention) -> str | None:
         """F7(b): the learning a parked ASK_USER ask carries — the
@@ -644,11 +1082,17 @@ class GoalRuntime:
                 message=message,
                 why=(f"a Workflow step of '{goal.name}' needs explicit owner "
                      "authority before it can run"),
-                decision=(f"Approve exactly this action with `company approve "
-                          f"{goal.id} --key {key}` (add --scope run to cover "
-                          "the rest of this run)"),
+                decision=("Approve exactly this action, or hold it back"),
                 after=("the run continues its Workflow; live external actions "
-                       "still only run after approval"))
+                       "still only run after approval"),
+                goal=goal,
+                machine={"goal_id": goal.id, "run_id": run.id,
+                         "stage": run.stage.value, "status": "waiting",
+                         "approval_key": key},
+                answer_syntax={
+                    "approve": f"company approve {goal.id} --key {key}",
+                    "approve_run": (f"company approve {goal.id} --key {key} "
+                                    "--scope run")})
         return _owner_ask(
             message=message,
             why=(f"run {run.sequence} of '{goal.name}' parked bounded work "
@@ -656,7 +1100,10 @@ class GoalRuntime:
             decision=("Execute the parked work order and complete it with "
                       "its declared evidence"),
             after=("on completion the run advances; external actions still "
-                   "park for approval first"))
+                   "park for approval first"),
+            goal=goal,
+            machine={"goal_id": goal.id, "run_id": run.id,
+                     "stage": run.stage.value, "status": "waiting"})
 
     @staticmethod
     def _consecutive_escalations(connection, goal_id: str, sequence: int) -> int:
@@ -731,7 +1178,8 @@ class GoalRuntime:
                      evidence_ids_json,created_at)
                     VALUES (?,?,?,?,?,?,?,?,?)""",
                     (f"memory-{uuid.uuid4().hex[:12]}", "strategy",
-                     evaluation.strategy_learning, goal.id, run.id, None, None,
+                     evaluation.strategy_learning, goal.id, run.id, None,
+                     evaluation.strategy_workflow_id,
                      json.dumps(evaluation.evidence_ids), stamp))
             if evaluation.goal_complete:
                 connection.execute("UPDATE core_goals SET status='complete',updated_at=? WHERE id=?",
@@ -747,6 +1195,97 @@ class GoalRuntime:
                          None, "owner_input_required", json.dumps(park), stamp))
                 else:
                     _insert_next_run(connection, goal.id, "ready")
+        if evaluation.goal_complete:
+            # The atomic adoption boundary (issue #8) runs after the
+            # evaluation commits: a completed repair goal adopts the
+            # revised Workflow, writes the revision learning, and wakes
+            # the original blocked run in ONE transaction, so the
+            # revision, its version, and its provenance never disagree.
+            self._adopt_repair(goal, run)
+
+    def _adopt_repair(self, goal: Goal, run: GoalRun) -> None:
+        """Atomic adoption when a bounded repair Goal completes (issue #4/#8).
+
+        Reads the repair contract from the completing goal's config; when
+        its acceptance evidence carries a revised workflow definition,
+        validates it, persists it through the one WorkflowRepository
+        writer (version bump on change — historical WorkflowRun snapshots
+        stay untouched), records the revision learning grounded in the
+        acceptance evidence, and wakes the original blocked run — all in
+        ONE transaction, so the revised definition, its version, and its
+        provenance can never disagree. Runs only when the completing
+        goal IS a repair goal; ordinary completions pay one config read.
+        """
+        repair = (goal.config or {}).get("repair")
+        if not isinstance(repair, dict):
+            return
+        blocked_goal_id = repair.get("blocked_goal_id")
+        revision = None
+        for evidence in self.evidence.for_run(run.id):
+            payload = evidence.payload or {}
+            if isinstance(payload.get("workflow"), dict):
+                revision = payload["workflow"]
+        if revision is None:
+            return  # a repair without a revised definition adopts nothing
+        declared = dict(revision)
+        workflow_id = declared.get("id") or repair.get("workflow_id")
+        if not workflow_id:
+            return
+        steps = tuple(
+            WorkflowStep(**item) for item in declared.get("steps") or ())
+        try:
+            existing = self.resolution.workflows.get(workflow_id)
+        except KeyError:
+            existing = None
+        saved = self.resolution.workflows.save(Workflow(
+            workflow_id, declared.get("name") or workflow_id, steps,
+            declared.get("department_id"), declared.get("version") or 1))
+        if existing is not None and existing.steps != saved.steps:
+            lesson = (f"revised to v{saved.version} because the "
+                      f"{repair.get('defect_kind', 'structural')} defect "
+                      f"'{(repair.get('summary') or '')[:120]}' was exposed "
+                      "by one execution and fixed with behavioral "
+                      "acceptance evidence")
+            self._remember_repair_learning(
+                goal, run, workflow_id, lesson)
+        if blocked_goal_id:
+            stamp = _now()
+            # The parked run RETRIES the repaired definition: its stale
+            # pre-defect decision (the one that declared the broken
+            # shape) is re-bound to the repaired workflow id with NO
+            # "workflow" declaration in its context, so the retry
+            # executes the persisted v2 through a fresh intervention
+            # instead of re-persisting the older shape over the repair
+            # or re-ranking candidates that would pick a different
+            # approach than the one just repaired.
+            retry = Decision(
+                "execute_workflow",
+                f"execute repaired {_workflow_label(workflow_id)}",
+                workflow_id,
+                context={"workflow_id": workflow_id, "repair_resume": True})
+            with self.database.connect() as connection:
+                connection.execute("""UPDATE core_runs
+                    SET stage=?,status='ready',decision_json=?,updated_at=?
+                    WHERE goal_id=? AND status='waiting'
+                      AND sequence=(SELECT MAX(sequence) FROM core_runs
+                                    WHERE goal_id=?)""",
+                    (GoalStage.ACT.value, json.dumps(retry.__dict__), stamp,
+                     blocked_goal_id, blocked_goal_id))
+                connection.execute("""DELETE FROM core_goal_edges
+                    WHERE source_goal_id=? AND target_goal_id=? AND relation='blocks'""",
+                    (goal.id, blocked_goal_id))
+
+    def _remember_repair_learning(self, goal: Goal, run: GoalRun,
+                                  workflow_id: str, lesson: str) -> None:
+        """Persist one revision-learning claim through the canonical
+        workflow-learning writer, with the workflow id supplied
+        explicitly (a repair goal's order is direct work, so the
+        WorkflowRun lookup cannot derive it)."""
+        evidence_ids = tuple(
+            item.id for item in self.evidence.for_run(run.id))
+        self.memory.remember(
+            "workflow", lesson, evidence_ids=evidence_ids,
+            goal_id=goal.id, run_id=run.id, workflow_id=workflow_id)
 
     @staticmethod
     def _decision_identity(decision) -> tuple | None:
@@ -782,10 +1321,15 @@ class GoalRuntime:
                                                    sequence=run.sequence,
                                                    interval=interval),
                 why=(f"run {run.sequence} of '{goal.name}' reached the goal's "
-                     f"review_every={interval} checkpoint; the owner asked "
-                     "to look at the goal at this cadence"),
+                     f"review checkpoint (every {interval} runs); the owner "
+                     "asked to look at the goal at this cadence"),
                 decision=PARK_DECISION,
-                after=PARK_AFTER.format(goal_id=goal.id))
+                after=PARK_AFTER,
+                goal=goal,
+                machine={"goal_id": goal.id, "run_id": run.id,
+                         "stage": "OBSERVE", "status": "waiting",
+                         "park": "review", "review_every": interval},
+                answer_syntax={"resume": f"company goal resume {goal.id}"})
         threshold = config.get("stall_threshold", 3)
         if not isinstance(threshold, int) or threshold < 2:
             threshold = 3
@@ -815,16 +1359,24 @@ class GoalRuntime:
         if not repeated:
             return None
         return _owner_ask(
-            message=STALL_PARK_MESSAGE.format(name=goal.name, metric=goal.metric,
-                                              value=json.dumps(value),
-                                              count=threshold),
-            why=(f"{goal.metric} has held {json.dumps(value)} across the last "
-                 f"{threshold} evaluated runs and every one of them made the "
-                 f"same decision ({identity[1]}), so repeating it cannot move "
-                 "the metric; only a changed decision chains — evidence alone "
-                 "no longer counts as progress"),
+            message=STALL_PARK_MESSAGE.format(
+                name=goal.name,
+                progress=human_progress(goal.metric, value, goal.target),
+                count=threshold),
+            why=(f"'{goal.name}' has held {human_progress(goal.metric, value, goal.target)} "
+                 f"across the last {threshold} evaluated runs and every one "
+                 "of them made the same decision, so repeating it cannot move "
+                 "the goal forward; only a changed decision chains — "
+                 "evidence alone no longer counts as progress"),
             decision=PARK_DECISION,
-            after=PARK_AFTER.format(goal_id=goal.id))
+            after=PARK_AFTER,
+            goal=goal,
+            machine={"goal_id": goal.id, "run_id": run.id,
+                     "stage": "OBSERVE", "status": "waiting",
+                     "metric": goal.metric, "operator": goal.operator,
+                     "target": goal.target, "value": value,
+                     "park": "stall", "stall_threshold": threshold},
+            answer_syntax={"resume": f"company goal resume {goal.id}"})
 
     def resume(self, goal_id: str) -> dict:
         run = self.runs.current(goal_id)

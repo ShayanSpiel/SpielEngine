@@ -19,6 +19,15 @@ or assigning bounded direct work whose instruction is mandatory. Stalled goals
 and `review_every` checkpoints park for `company goal resume`. Progressing
 runs chain automatically: there are no per-run owner gates.
 
+Owner voice is the default on every owner-facing surface: goals, evidence,
+memory, and asks render as names, human progress, and outcome sentences
+with named options. Raw goal/evidence ids, metric keys, stage or decision
+enums, JSON dumps, and CLI answer syntax never enter owner-facing text;
+they ride the payload machine fields and one `Machine reference` line at
+the end of the context projection for the Director alone, quoted only when
+the owner asks for technical detail. The owner answers in plain words; the
+Director records the answer through the CLI itself.
+
 Memory is causal and classified: WorkOrder briefs carry the bounded active
 learning for the work they open (workflow-scope claims for workflow orders,
 goal-relevant claims for direct ones — including the goal's own direct-work

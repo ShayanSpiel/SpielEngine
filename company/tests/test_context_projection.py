@@ -57,8 +57,12 @@ class ContextProjectionTests(unittest.TestCase):
 
             self.assertIn("Request: continue the campaign", context)
             self.assertIn("Goal: Ship campaign", context)
-            self.assertIn("Attention: owner_input_required: approve the YouTube upload",
+            # Owner voice: notification kinds render in owner words, and
+            # every id rides the Machine reference line.
+            self.assertIn("Attention: waiting on you: approve the YouTube upload",
                           context)
+            self.assertNotIn("owner_input_required",
+                             context.split("Machine reference:")[0])
             self.assertIn("Profile: identity.name=", context)
             self.assertIn("Layout: ok", context)
             self.assertIn(f"goal:{goal.id}", projection["sources"])

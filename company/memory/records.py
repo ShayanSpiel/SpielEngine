@@ -110,19 +110,20 @@ class MemoryRepository:
                  workflow_id: str | None = None) -> list[Memory]:
         """Active memory claims that apply to one Goal or Workflow.
 
-        Owner claims always apply. Strategy claims apply to their own
-        Goal and — the goal topology — to every Goal it is structurally
-        related to: siblings (same owner and metric), its parent, its
-        children, and both directions of a ``supports`` edge. So one
-        Goal's evidenced learning informs the Goals it shares structure
-        with, while unrelated Goals (no edge, different owner and
-        metric, no parent link) receive nothing. Workflow claims apply
-        only with their workflow_id — with one exception: direct-work
-        lessons (workflow-scope claims with ``workflow_id`` NULL) are
-        the Goal's own operational learning, so a goal query returns
-        them for that Goal exactly (``goal_id`` matches the queried
-        Goal; they never reach another Goal's query). Explicit SQL
-        joins only — no embeddings, no clustering.
+        Owner claims always apply (owner memory is company-global by
+        design; a goal/workflow filter never scopes it). Strategy claims
+        apply to their own Goal and — only through explicit goal
+        topology — to genuine siblings (same parent), its parent, its
+        children, and both directions of a ``supports`` edge. Sharing an
+        owner and a metric is NOT a strategy relation: two campaigns can
+        carry the same owner and metric while pursuing materially
+        different strategies, so no owner/metric join exists. Workflow
+        claims apply only with their workflow_id — with one exception:
+        direct-work lessons (workflow-scope claims with ``workflow_id``
+        NULL) are the Goal's own operational learning, so a goal query
+        returns them for that Goal exactly (``goal_id`` matches the
+        queried Goal; they never reach another Goal's query). Explicit
+        SQL joins only — no embeddings, no clustering.
         """
         if limit < 1:
             return []
@@ -133,18 +134,17 @@ class MemoryRepository:
         if goal_id:
             # The strategy-scope set: this Goal's own claims plus the
             # active strategy claims of structurally related Goals —
-            # siblings (same owner_id and metric, joined through
-            # core_goals/core_goal_metadata), the parent, the children,
-            # and supports-related Goals in both directions
-            # (core_goal_edges relation='supports').
+            # genuine siblings (the same non-null parent), the parent,
+            # the children, and supports-related Goals in both
+            # directions (core_goal_edges relation='supports'). Owner
+            # and metric equality alone never joins two Goals.
             applicable.append("""(scope='strategy' AND (
                 goal_id=? OR goal_id IN (
                     SELECT sibling.id FROM core_goals sibling
-                    JOIN core_goal_metadata sib ON sib.goal_id=sibling.id
-                    JOIN core_goal_metadata focus ON focus.goal_id=?
-                    WHERE sibling.metric=(SELECT metric FROM core_goals
-                                           WHERE id=?)
-                      AND sib.owner_id=focus.owner_id)
+                    WHERE sibling.parent_id IS NOT NULL
+                      AND sibling.parent_id=(SELECT parent_id FROM core_goals
+                                              WHERE id=?)
+                      AND sibling.id<>?)
                 OR goal_id IN (SELECT parent_id FROM core_goals
                                WHERE id=? AND parent_id IS NOT NULL)
                 OR goal_id IN (SELECT id FROM core_goals WHERE parent_id=?)

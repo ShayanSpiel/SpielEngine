@@ -110,7 +110,7 @@ def build_parser():
     tasks.add_argument("work_order_id", nargs="?"); tasks.add_argument("--status", default="active", choices=("active", "open", "claimed"))
     tasks.add_argument("--goal"); tasks.add_argument("--limit", type=int, default=50); tasks.add_argument("--claim"); tasks.add_argument("--complete")
     tasks.add_argument("--evidence", default="[]")
-    tasks.add_argument("--learning", help="workflow memory claim grounded in the completion evidence")
+    tasks.add_argument("--learning", help="a genuinely reusable operational lesson grounded in the completion evidence; omit when nothing was learned")
     tasks.add_argument("--json", action="store_true")
     runner = commands.add_parser("runner")
     runner_commands = runner.add_subparsers(dest="runner_command", required=True)

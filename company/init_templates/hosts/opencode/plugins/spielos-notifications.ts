@@ -13,8 +13,11 @@
 
 type Any = Record<string, any>
 
-// The clean core parks live actions as one kind of owner attention.
-const REPORTABLE = new Set(["owner_input_required"])
+// Two attention kinds reach the host session: genuine owner asks
+// (approval gates, material strategic boundaries, stalls, reviews) and
+// host-dispatched work (a parked WorkOrder its assigned Agent executes).
+// The Director renders the former to the owner and executes the latter.
+const REPORTABLE = new Set(["owner_input_required", "host_work_required"])
 
 const homeAt = (directory: string): Promise<boolean> => {
   if (typeof directory !== "string" || !directory) return Promise.resolve(false)

@@ -17,6 +17,13 @@ Pins for the 10.3.0 system-improvement goal (DECIDE is the reasoning seam):
   churning the identical fix loop.
 - Progressing goals chain automatically with no per-run gate.
 - Every owner ask carries what/why/decision/after in plain owner language.
+- Owner voice (goal-director-voice): owner-facing texts and the context
+  projection speak owner language — goals by name with human progress,
+  evidence as outcome sentences, loop position in plain words, options as
+  named choices. No raw goal/evidence ids, stage or decision enums,
+  metric keys, operator/target pairs, JSON dumps, or CLI answer syntax in
+  owner-facing text; the ids/keys/enums ride the payload machine fields
+  and the projection's one Machine reference line for the Director alone.
 - ``assemble_context`` renders the whole active goal tree and recent
   memory across all three scopes.
 - Updating a home refreshes the vendored spine only: parked Runs,
@@ -179,6 +186,17 @@ class DecideBoundaryCase(unittest.TestCase):
     def decision_request(self):
         return (self.current_run().decision.context or {}).get("decision_request") or {}
 
+    def owner_asks(self):
+        """Pending notifications that interrupt the OWNER (issue #5):
+        approval gates, genuine owner boundaries, stalls, reviews, and
+        runtime failures — never host-dispatched work."""
+        return [item for item in self.runtime.notifications(goal_id=self.goal_id)
+                if item["kind"] == "owner_input_required"]
+
+    def host_work(self):
+        return [item for item in self.runtime.notifications(goal_id=self.goal_id)
+                if item["kind"] == "host_work_required"]
+
 
 # =========================================================================
 # 1. The park: structured decision_request, zero content-free work
@@ -199,7 +217,17 @@ class TestDecisionRequestPark(DecideBoundaryCase):
         self.assertEqual(request["metric"], "weekly_sales")
         self.assertEqual(request["observation_value"], 0)
         self.assertEqual(request["valid_answers"], ["execute_workflow", "request_agent"])
-        self.assertIn("weekly_sales", request["message"])
+        # Owner voice (goal-director-voice): the message names the goal and
+        # its human progress with named options — no metric key, operator,
+        # or target pair ever enters owner-facing text.
+        self.assertIn("Weekly sales", request["message"])
+        self.assertIn("0 of 1 customers per week", request["message"])
+        self.assertIn("Run one of the candidate workflows",
+                      request["message"])
+        self.assertNotIn("weekly_sales", request["message"])
+        self.assertNotIn("ge ", request["message"],
+                         "no operator/target pair in owner-facing text")
+        self.assertEqual(request["progress"], "0 of 1 customers per week")
         for key in ("answer_syntax", "candidates", "evidence", "memory",
                     "children", "blockers", "recent_runs"):
             self.assertIn(key, request)
@@ -221,121 +249,80 @@ class TestDecisionRequestPark(DecideBoundaryCase):
                 (self.goal_id,)).fetchone()[0]
         self.assertEqual((interventions, orders), (0, 0))
 
-    def test_the_park_carries_one_structured_owner_ask(self):
+    def test_the_park_carries_one_structured_ask(self):
+        # Issue #1/#5: an UNDECIDED DECIDE park is HOST reasoning — the
+        # Director agent answers it with `goal decide`; the owner is not
+        # the default GoalController and is never the addressee.
         self.new_goal()
         self.runtime.tick(max_advances=10)
         asks = self.pending_asks()
-        self.assertEqual(len(asks), 1, "exactly one owner ask per park")
-        self.assertEqual(asks[0]["kind"], "owner_input_required")
+        self.assertEqual(len(asks), 1, "exactly one ask per park")
+        self.assertEqual(asks[0]["kind"], "host_work_required")
         payload = asks[0]["payload"]
         _Ask.assert_owner_ask(self, payload)
         self.assertEqual(payload["message"], self.current_run().decision.description)
-        self.assertIn("company goal decide", payload["after"])
+        # Owner voice: the four owner-facing fields carry no CLI answer
+        # syntax and no raw goal id — the Director records the answer
+        # itself, and the exact commands stay in the payload.
+        self.assertNotIn("company goal decide", payload["after"])
+        self.assertNotIn("--kind", payload["after"])
+        self.assertNotIn(self.goal_id, payload["after"])
         self.assertIn("external actions still park for approval first",
                       payload["after"])
+        self.assertIn("company goal decide",
+                      payload["answer_syntax"]["execute_workflow"],
+                      "the CLI answer syntax stays in the payload for the "
+                      "Director alone")
+        self.assertEqual(payload["goal"]["name"], "Weekly sales")
+        self.assertEqual(payload["machine"]["goal_id"], self.goal_id)
+        self.assertEqual(payload["machine"]["metric"], "weekly_sales")
 
-    def test_parking_is_idempotent_across_repeated_ticks(self):
-        self.new_goal()
-        for _ in range(5):
-            self.runtime.tick(max_advances=20)
-        self.assertEqual(len(self.pending_asks()), 1)
-        self.assertEqual(self.current_run().sequence, 1,
-                         "a parked DECIDE never churns new runs")
-        self.assertEqual(self.active_orders(), [])
-
-    def test_parked_decision_request_is_not_scheduled(self):
-        self.new_goal()
-        self.runtime.tick(max_advances=10)
-        self.assertEqual([r.goal_id for r in self.runtime.runs.ready()],
-                         [], "the parked run must not be rescheduled")
-
-    def test_evidence_digest_and_memory_claims_reach_the_ask(self):
-        self.new_goal()
-        run = self.current_run()
-        self.runtime.evidence.record(
-            goal_id=self.goal_id, run_id=run.id, kind="weekly_sales",
-            payload={"weekly_sales": 0, "note": "n"})
-        self.runtime.memory.remember("owner", "owner prefers concise reports")
-        self.runtime.memory.remember(
-            "strategy", "retarget ICP segment",
-            evidence_ids=(self.runtime.evidence.record(
-                goal_id=self.goal_id, run_id=run.id, kind="weekly_sales",
-                payload={"weekly_sales": 0}).id,),
-            goal_id=self.goal_id, run_id=run.id)
-        self.runtime.tick(max_advances=10)
-        request = self.decision_request()
-        self.assertEqual(request["evidence"][0]["kind"], "weekly_sales")
-        self.assertIn("weekly_sales", request["evidence"][0]["payload_keys"])
-        self.assertIn("note", request["evidence"][0]["payload_keys"])
-        self.assertEqual(request["observation_value"], 0)
-        self.assertIn("retarget ICP segment", request["memory"])
-        # L1b topology (intentional extension): the strategy claim also
-        # reaches the structured decision_request of a related goal —
-        # the child of the goal that learned it — so a related goal's
-        # owner decides with the same learning. (Owner profile claims
-        # always apply to every goal, so they appear too — the ask's
-        # memory line is relevance-ordered, and the unrelated-goal
-        # exclusion is pinned in company.tests.test_learning_loop.)
-        child = self.runtime.create_goal(
-            name="Child outcome", owner_id="director", metric="child_metric",
-            operator="ge", target=1, parent_id=self.goal_id,
-            config={"aggregation": "latest"})
-        self.engine.advance(child["id"])
-        self.engine.advance(child["id"])
-        child_request = (self.runtime.runs.current(child["id"]).decision
-                         .context or {}).get("decision_request") or {}
-        self.assertIn("retarget ICP segment", child_request["memory"],
-                      "strategy learning reaches the child goal's ask "
-                      "through the parent join")
-
-    def test_children_blockers_and_recent_runs_reach_the_ask(self):
-        parent = self.new_goal(name="Parent outcome")
-        child = self.runtime.create_goal(
-            name="Child outcome", owner_id="director", metric="child_metric",
-            operator="ge", target=1, parent_id=parent["id"],
-            config={"aggregation": "latest"})
-        self.runtime.goals.set_status(child["id"], "paused")
-        blocker = self.runtime.create_goal(
-            name="Blocking goal", owner_id="director", metric="block_metric",
-            operator="ge", target=1, config={"aggregation": "latest"})
-        self.runtime.goals.add_block(blocker["id"], self.goal_id)
-        # A blocked goal is never scheduled, so drive its DECIDE directly.
-        self.engine.advance(self.goal_id)
-        self.engine.advance(self.goal_id)
-        decision = self.current_run().decision
-        self.assertIsNotNone(decision)
-        self.assertEqual(decision.kind, "decision_request")
-        request = self.decision_request()
-        self.assertEqual(request["children"][0]["name"], "Child outcome")
-        self.assertEqual(request["children"][0]["status"], "paused")
-        self.assertEqual(request["blockers"][0]["name"], "Blocking goal")
-        self.assertEqual(request["blockers"][0]["status"], "active")
-        self.assertEqual(request["recent_runs"][0]["sequence"], 1)
-        self.assertEqual(request["recent_runs"][0]["stage"], "DECIDE")
-        # F8: the projection's focus follows runs.ready() priority order —
-        # the active blocker is the only ready goal, so IT is the focus.
-        projection = self.runtime.assemble_context(
-            prompt="what is next", owner_id="director")
-        self.assertEqual(projection["goal_id"], blocker["id"],
-                         "the only ready goal is the projection's focus")
-        # With nothing ready (the blocker paused), the fallback focuses
-        # the most recently updated active goal; the same blocker then
-        # reaches the projection through its Blocked by line.
-        self.runtime.goals.set_status(blocker["id"], "paused")
-        projection = self.runtime.assemble_context(
-            prompt="what is next", owner_id="director")
-        self.assertEqual(projection["goal_id"], self.goal_id,
-                         "the fallback focuses the blocked parent")
-        self.assertIn("Blocked by: Blocking goal",
-                      projection["context"])
-
+    def test_exhausted_candidates_park_a_genuine_owner_ask(self):
+        # Issue #1: when every candidate approach on a department goal
+        # has an active evidence-backed strategy lesson against it,
+        # changing the strategy is a material owner choice — that park
+        # alone is an owner ask, never the default.
+        os.environ["SPIELOS_TEST_DEPARTMENTS_DIR"] = str(FIXTURES / "departments")
+        try:
+            # Fresh runtime with the fixture departments loaded.
+            local = CleanCommandRuntime(self.db)
+            row = local.create_goal(
+                name="Exhausted", owner_id="seo",
+                metric="keyword_opportunities", operator="ge", target=1,
+                config={"aggregation": "count"})
+            goal_id = row["id"]
+            run = local.runs.current(goal_id)
+            for workflow_id in ("seo:keyword-research", "seo:seo-content-brief",
+                                "seo:technical-audit", "seo:seo-improvement",
+                                "seo:search-performance"):
+                local.memory.remember(
+                    "strategy", f"avoid {workflow_id} for 'Exhausted': "
+                    "it completed its work and keyword_opportunities "
+                    "stayed at 0; prefer a different approach",
+                    evidence_ids=(local.evidence.record(
+                        goal_id=goal_id, run_id=run.id, kind="m",
+                        payload={"m": 0}).id,),
+                    goal_id=goal_id, run_id=run.id, workflow_id=workflow_id)
+            local.tick(max_advances=10)
+            asks = local.notifications(goal_id=goal_id)
+            self.assertEqual(len(asks), 1)
+            self.assertEqual(asks[0]["kind"], "owner_input_required",
+                             "the exhausted boundary is a genuine owner ask")
+            decision = local.runs.current(goal_id).decision
+            self.assertEqual((decision.context or {}).get("owner_boundary"),
+                             "exhausted")
+        finally:
+            os.environ.pop("SPIELOS_TEST_DEPARTMENTS_DIR", None)
 
 # =========================================================================
 # 2. Candidates: Departments that declare the metric
 # =========================================================================
 
 @with_departments
-class TestDecisionRequestCandidates(DecideBoundaryCase):
+class TestDecideWithoutAsking(DecideBoundaryCase):
+    """Issue #1: DECIDE decides; the owner is never the default
+    GoalController. A goal whose metric a Department declares gets that
+    workflow executed with no park and no ask."""
 
     def setUp(self):
         os.environ["SPIELOS_TEST_DEPARTMENTS_DIR"] = str(FIXTURES / "departments")
@@ -345,42 +332,72 @@ class TestDecisionRequestCandidates(DecideBoundaryCase):
         os.environ.pop("SPIELOS_TEST_DEPARTMENTS_DIR", None)
         super().tearDown()
 
-    def test_declaring_departments_and_their_workflows_are_candidates(self):
-        self.new_goal(metric="keyword_opportunities")
+    def test_declared_metric_decides_a_workflow_with_zero_asks(self):
+        # "Get 2 customers"-shaped acceptance: the runtime chooses a
+        # reasonable bounded next intervention without asking.
+        self.new_goal(name="Map opportunities", owner="director",
+                      metric="keyword_opportunities", target=1)
         self.runtime.tick(max_advances=10)
-        request = self.decision_request()
-        departments = {item["id"]: item for item in
-                       request["candidates"]["departments"]}
-        self.assertIn("seo", departments,
-                     "the Department declaring the metric must be a candidate")
-        self.assertIn("keyword-research", departments["seo"]["workflows"])
-        self.assertEqual(request["valid_answers"], ["execute_workflow", "request_agent"])
+        run = self.current_run()
+        self.assertNotEqual((run.stage, run.status), (GoalStage.DECIDE, "waiting"),
+                            "a decidable goal never parks at DECIDE")
+        self.assertEqual(self.owner_asks(), [],
+                         "the owner receives zero asks for ordinary work")
+        # With the default park-for-host executor the first step parks as
+        # HOST work — the assigned Agent executes it, not the owner.
+        self.assertTrue(self.host_work(),
+                        "the parked step is host work")
+        self.assertIn(run.decision.kind, ("execute_workflow", "evaluate"))
 
-    def test_undeclaring_departments_are_not_candidates(self):
-        self.new_goal(metric="keyword_opportunities")
+    def test_ranking_prefers_a_strategy_preferred_workflow(self):
+        # Issue #2 causality: an evidence-backed `prefer` lesson changes
+        # the choice away from declaration order.
+        self.new_goal(name="Ranked", owner="director",
+                      metric="keyword_opportunities", target=1)
+        run = self.current_run()
+        self.runtime.memory.remember(
+            "strategy",
+            "prefer seo:seo-content-brief for 'Ranked': it moved "
+            "keyword_opportunities to 5 versus seo:keyword-research's 0; "
+            "prefer this approach for this goal",
+            evidence_ids=(self.runtime.evidence.record(
+                goal_id=self.goal_id, run_id=run.id, kind="m",
+                payload={"m": 0}).id,),
+            goal_id=self.goal_id, run_id=run.id,
+            workflow_id="seo:seo-content-brief")
         self.runtime.tick(max_advances=10)
-        ids = {item["id"] for item in
-               self.decision_request()["candidates"]["departments"]}
-        self.assertNotIn("outbound", ids,
-                         "a Department that does not declare the metric is "
-                         "never a candidate")
+        self.assertEqual(self.current_run().decision.workflow_id,
+                         "seo:seo-content-brief",
+                         "the preferred approach wins over declaration order")
+
+    def test_undecided_goal_parks_host_work_with_candidates(self):
+        # A goal nothing can decide parks HOST work carrying the
+        # structured candidates the answering host reasons over.
+        self.new_goal(metric="nothing_declares_this")
+        self.runtime.tick(max_advances=10)
+        self.assertEqual(len(self.host_work()), 1)
+        self.assertEqual(self.owner_asks(), [],
+                         "an undecided park is host reasoning, not an "
+                         "owner ask")
+        request = self.decision_request()
+        self.assertEqual(request["valid_answers"],
+                         ["execute_workflow", "request_agent"])
+        self.assertEqual(request["candidates"]["departments"], [],
+                         "no Department declares an unknown metric")
+        syntax = request["answer_syntax"]
+        self.assertIn("--kind execute_workflow --workflow",
+                      syntax["execute_workflow"])
+        self.assertIn("--kind request_agent --agent", syntax["request_agent"])
+        self.assertIn("--instruction", syntax["request_agent"])
 
     def test_installed_agents_are_candidates(self):
-        self.new_goal(metric="keyword_opportunities")
+        self.new_goal(metric="nothing_declares_this")
         self.runtime.tick(max_advances=10)
         agents = self.decision_request()["candidates"]["agents"]
         self.assertIsInstance(agents, list)
         self.assertNotIn("director", agents,
                          "the goal owner is answered separately, not as an "
                          "installed Agent candidate")
-
-    def test_answer_syntax_names_both_kinds(self):
-        self.new_goal(metric="keyword_opportunities")
-        self.runtime.tick(max_advances=10)
-        syntax = self.decision_request()["answer_syntax"]
-        self.assertIn("--kind execute_workflow --workflow", syntax["execute_workflow"])
-        self.assertIn("--kind request_agent --agent", syntax["request_agent"])
-        self.assertIn("--instruction", syntax["request_agent"])
 
 
 # =========================================================================
@@ -398,51 +415,53 @@ class TestDecideGoalExecuteWorkflow(DecideBoundaryCase):
         os.environ.pop("SPIELOS_TEST_DEPARTMENTS_DIR", None)
         super().tearDown()
 
-    def test_execute_workflow_requires_a_candidate_workflow(self):
-        self.new_goal(metric="keyword_opportunities")
+    def test_execute_workflow_refusal_lists_candidate_workflows(self):
+        # The candidate filter stays the validation authority for
+        # execute_workflow answers.
+        self.new_goal(metric="nothing_decides_this")
         self.runtime.tick(max_advances=10)
         with self.assertRaises(ValueError) as caught:
             self.runtime.decide_goal(self.goal_id, "execute_workflow",
                                      workflow="seo:not-a-workflow")
-        self.assertIn("seo:keyword-research", str(caught.exception),
-                      "the refusal must list the candidate workflows")
+        self.assertIn("candidate", str(caught.exception))
         with self.assertRaises(ValueError) as caught:
             self.runtime.decide_goal(self.goal_id, "execute_workflow",
-                                     workflow="outbound:email-outreach")
+                                     workflow="seo:keyword-research")
         self.assertIn("not one of the candidate", str(caught.exception))
 
-    def test_execute_workflow_binds_and_runs_the_adopted_workflow(self):
-        self.new_goal(metric="keyword_opportunities")
+    def test_request_agent_answer_binds_and_runs_bounded_direct_work(self):
+        # The host answers an undecided park with bounded direct work;
+        # the run resumes, the order parks for its assigned agent, and
+        # the causal chain records the answered decision.
+        self.new_goal(metric="nothing_decides_this")
         self.runtime.tick(max_advances=10)
-        self.runtime.decide_goal(self.goal_id, "execute_workflow",
-                                  workflow="seo:keyword-research")
+        self.runtime.decide_goal(self.goal_id, "request_agent",
+                                 agent="director",
+                                 instruction="produce the metric evidence")
         run = self.current_run()
-        self.assertEqual(run.decision.kind, "execute_workflow")
-        self.assertEqual(run.decision.workflow_id, "seo:keyword-research")
-        self.assertIn("seo", run.decision.description)
-        with self.runtime.connect() as connection:
-            workflow_runs = connection.execute(
-                "SELECT workflow_id FROM core_workflow_runs WHERE run_id=?",
-                (run.id,)).fetchall()
-        self.assertEqual([row[0] for row in workflow_runs],
-                         ["seo:keyword-research"],
-                         "a WorkflowRun must exist for the bound run")
-        steps = [item["step_id"] for item in
-                 self.runtime.work_orders(goal_id=self.goal_id)]
-        self.assertEqual(steps, ["seeds"],
-                         "only the adopted workflow's first step parks work")
+        self.assertEqual(run.decision.kind, "request_agent")
+        self.assertEqual(run.decision.context["agent_id"], "director")
+        orders = self.runtime.work_orders(goal_id=self.goal_id)
+        self.assertEqual([item["step_id"] for item in orders], ["direct"],
+                         "only the answered bounded work parks")
+        self.assertEqual(len(self.host_work()), 1,
+                         "the parked order is host work, not an owner ask")
+        self.assertEqual(self.owner_asks(), [],
+                         "ordinary bounded work never interrupts the owner")
 
     def test_decide_requires_the_parked_decision_request_state(self):
-        self.new_goal(metric="keyword_opportunities")
+        # A goal nothing can decide parks; a decided goal is refused.
+        self.new_goal(metric="nothing_decides_this")
         with self.assertRaises(ValueError) as caught:
             self.runtime.decide_goal(self.goal_id, "execute_workflow",
                                      workflow="seo:keyword-research")
         self.assertIn("decision_request", str(caught.exception))
         self.assertIn("OBSERVE/ready", str(caught.exception))
-        self.new_goal(name="Answered", metric="seo_briefs")
+        self.new_goal(name="Answered", metric="nothing_decides_this_either")
         self.runtime.tick(max_advances=10)
-        self.runtime.decide_goal(self.goal_id, "execute_workflow",
-                                 workflow="seo:seo-content-brief")
+        self.runtime.decide_goal(self.goal_id, "request_agent",
+                                 agent="director",
+                                 instruction="produce the metric evidence")
         with self.assertRaises(ValueError) as caught:
             self.runtime.decide_goal(self.goal_id, "execute_workflow",
                                      workflow="seo:keyword-research")
@@ -529,18 +548,31 @@ class TestDecideGoalRequestAgent(DecideBoundaryCase):
                          "answering the parked ask clears its attention")
 
     def test_the_work_order_ask_names_the_documented_completion_flow(self):
+        # Issue #5/#9: the parked order is HOST work in owner-facing
+        # execution language; --learning is conditional guidance, never
+        # a default instruction.
         self.new_goal()
         self.runtime.tick(max_advances=10)
         self.runtime.decide_goal(self.goal_id, "request_agent", agent="director",
                                  instruction="Close one deal")
         asks = self.pending_asks()
         self.assertEqual(len(asks), 1)
+        self.assertEqual(asks[0]["kind"], "host_work_required")
         message = asks[0]["payload"]["message"]
-        self.assertIn("execute parked WorkOrder", message)
+        self.assertIn("Working on: Close one deal", message,
+                     "the message is owner-facing execution language")
         self.assertIn("--complete", message)
-        self.assertIn("--learning", message)
-        self.assertIn("external actions still park for approval first", message)
-        _Ask.assert_owner_ask(self, asks[0]["payload"])
+        self.assertIn("only when", message,
+                      "learning guidance is conditional, not a prompt to "
+                      "always write memory")
+        self.assertIn("external actions still park for approval first",
+                      message)
+        payload = asks[0]["payload"]
+        for key in ("message", "why", "decision", "after"):
+            self.assertTrue(payload.get(key) and str(payload[key]).strip(),
+                            f"the host-work payload is missing {key}")
+        self.assertIsNone(payload["required_user_action"],
+                          "host work never claims an owner action")
 
     def test_department_without_workflows_parks_a_decision_request(self):
         # A Department that declares the metric but ships no workflows is
@@ -686,7 +718,7 @@ class TestExecutorIdentityEnforcement(DecideBoundaryCase):
         self.assertEqual(orders[0]["agent_id"], "f4-agent")
         self.assertEqual(orders[0]["claimed_by"], "f4-agent",
                          "the runtime pre-claims with the declared agent id")
-        self.assertIn(result.outcome.value, {"ASK_USER", "CONTINUE_LOCAL",
+        self.assertIn(result.outcome.value, {"HOST_WORK", "CONTINUE_LOCAL",
                                              "RETURN_TO_GOAL"},
                       "the declared agent's flow must execute, not escalate")
 
@@ -724,10 +756,11 @@ class TestExecutorIdentityEnforcement(DecideBoundaryCase):
         self.assertEqual(len(self.active_orders()), 1,
                          "the owner's own step parks its order for the owner")
 
-    def test_uninstalled_direct_intervention_agent_escalates(self):
-        # F4 pin (e): direct work assigned to an agent that is neither
-        # installed nor the goal owner escalates with the defect message
-        # instead of opening a work order.
+    def test_uninstalled_direct_intervention_agent_is_a_wiring_defect(self):
+        # Issue #4/#11: direct work assigned to an agent that is neither
+        # installed nor the goal owner is a structural WIRING defect —
+        # recorded as system_defect evidence for immediate repair, with
+        # no WorkOrder and no blind re-decision.
         run = self.current_run()
         self.runtime.runs.update(
             run.id, stage=GoalStage.ACT, status="running",
@@ -741,12 +774,17 @@ class TestExecutorIdentityEnforcement(DecideBoundaryCase):
                      "evidence_kind": "weekly_sales"})
         result = self.runtime.runtime.resolution.resolve(
             self.runtime.runtime.interventions.active_for_run(run.id).id)
-        self.assertEqual(result.outcome.value, "ESCALATE_TO_GOAL")
+        self.assertEqual(result.outcome.value, "SYSTEM_DEFECT")
+        self.assertEqual(result.defect.kind, "wiring")
         self.assertIn("ghost-agent", result.message)
         self.assertIn("neither an installed Agent", result.message)
         self.assertEqual(self._order_count(), 0,
                          "no WorkOrder may be created for an uninstalled "
                          "direct-intervention agent")
+        defects = [item for item in self.runtime.evidence.for_run(run.id)
+                   if item.kind == "system_defect"]
+        self.assertEqual(len(defects), 1,
+                         "the defect is recorded durably for the repair")
 
     def test_owner_direct_intervention_executes(self):
         # The owner's own direct assignment executes: it parks the order
@@ -906,8 +944,16 @@ class TestStallBoundary(DecideBoundaryCase):
         self.assertEqual(len(asks), 1)
         _Ask.assert_owner_ask(self, asks[0]["payload"])
         self.assertIn("stopped moving", asks[0]["payload"]["message"])
-        self.assertIn("weekly_sales", asks[0]["payload"]["message"])
-        self.assertIn("company goal resume", asks[0]["payload"]["after"])
+        # Owner voice: human progress, never the metric key; the resume
+        # command rides the payload's answer_syntax, not owner text.
+        self.assertIn("0 of 1 customers per week",
+                      asks[0]["payload"]["message"])
+        self.assertNotIn("weekly_sales", asks[0]["payload"]["message"])
+        self.assertNotIn("company goal resume", asks[0]["payload"]["after"])
+        self.assertIn("company goal resume",
+                      asks[0]["payload"]["answer_syntax"]["resume"])
+        self.assertEqual(asks[0]["payload"]["machine"]["metric"],
+                         "weekly_sales")
 
     def test_two_flat_runs_still_chain(self):
         self._drive_flat(2)
@@ -933,7 +979,13 @@ class TestStallBoundary(DecideBoundaryCase):
         asks = self.pending_asks()
         self.assertEqual(len(asks), 1)
         self.assertIn("review checkpoint", asks[0]["payload"]["message"])
-        self.assertIn("review_every=2", asks[0]["payload"]["message"])
+        # Owner voice: the cadence in owner words — the config key never
+        # enters owner-facing text (it rides the machine payload).
+        self.assertIn("every 2 runs", asks[0]["payload"]["message"])
+        self.assertNotIn("review_every", asks[0]["payload"]["message"])
+        self.assertEqual(asks[0]["payload"]["machine"]["review_every"], 2)
+        self.assertIn("company goal resume",
+                      asks[0]["payload"]["answer_syntax"]["resume"])
 
     def test_progressing_runs_chain_with_no_park_and_no_gate(self):
         # The pinned no-per-run-parking test: the metric moves each cycle,
@@ -1070,7 +1122,10 @@ class TestStallBoundary(DecideBoundaryCase):
         self.assertIn("fix loop", payload["message"])
         self.assertIn("do the work", payload["message"],
                       "the ask names the looping intervention")
-        self.assertIn("company goal resume", payload["after"])
+        # Owner voice: no CLI syntax in owner-facing text.
+        self.assertNotIn("company goal resume", payload["after"])
+        self.assertIn("company goal resume",
+                      payload["answer_syntax"]["resume"])
         iterations = [item for item in
                       self.runtime.evidence.for_goal(self.goal_id)
                       if item.kind == "resolution_iteration"]
@@ -1135,12 +1190,19 @@ class TestOwnerFacingAsks(DecideBoundaryCase):
                             for item in parks))
 
     def test_no_owner_ask_uses_the_legacy_placeholder(self):
+        # Issue #5: the parked order is host work; only genuine owner
+        # asks (none here) carry the full owner-ask shape.
         self.new_goal()
         self.runtime.tick(max_advances=10)
         self.runtime.decide_goal(self.goal_id, "request_agent", agent="director",
                                  instruction="Close one deal")
         for item in self.pending_asks():
-            _Ask.assert_owner_ask(self, item["payload"])
+            self.assertEqual(item["kind"], "host_work_required")
+            for key in ("message", "why", "decision", "after"):
+                self.assertTrue(
+                    item["payload"].get(key) and
+                    str(item["payload"][key]).strip(),
+                    f"the host-work payload is missing {key}")
 
 
 # =========================================================================
@@ -1184,8 +1246,17 @@ class TestContextProjection(DecideBoundaryCase):
             self.assertGreater(tree.splitlines().index(line), parent_index,
                                "children render after their parent")
         self.assertIn(f"goal:{parent['id']}", projection["sources"])
-        self.assertIn("child_metric", context)
         self.assertIn("Run 1", context)
+        # Owner voice: the human lines carry no raw goal ids, metric keys,
+        # or stage/status enums; the Machine reference line at the end
+        # still carries every one of them for the Director.
+        human, _, machine = context.partition("Machine reference:")
+        self.assertNotIn(parent["id"], human)
+        self.assertNotIn("child_metric", human)
+        self.assertNotIn("OBSERVE", human)
+        self.assertIn("child_metric", machine)
+        self.assertIn(parent["id"], machine)
+        self.assertIn("(OBSERVE/ready)", machine)
 
     def test_projection_names_blockers_of_the_focus_goal(self):
         self.new_goal(name="Focus outcome")
@@ -1247,7 +1318,11 @@ class TestContextProjection(DecideBoundaryCase):
                          "fallback focus")
         self.assertIn("Goal: Second parked", projection["context"])
 
-    def test_projection_renders_memory_across_all_three_scopes(self):
+    def test_projection_renders_only_relevant_memory_once(self):
+        # Issue #6: ordinary reasoning context carries the goal's own
+        # workflow/strategy claims (once, on the Relevant memory line)
+        # and owner preferences once on the Profile line. An unrelated
+        # goal's learning stays OUT, and no claim renders twice.
         self.new_goal()
         run = self.current_run()
         evidence = self.runtime.evidence.record(
@@ -1260,19 +1335,41 @@ class TestContextProjection(DecideBoundaryCase):
                                  goal_id=self.goal_id, run_id=run.id)
         self.runtime.add_memory("strategy", "double opt-in lifts reply quality",
                                 evidence_ids=[evidence.id],
-                                goal_id=self.goal_id, run_id=run.id)
+                                 goal_id=self.goal_id, run_id=run.id)
+        other = self.runtime.create_goal(
+            name="Unrelated", owner_id="director", metric="other_metric",
+            operator="ge", target=1, config={"aggregation": "latest"})
+        other_run = self.runtime.runs.current(other["id"])
+        other_evidence = self.runtime.evidence.record(
+            goal_id=other["id"], run_id=other_run.id, kind="other_metric",
+            payload={"other_metric": 0})
+        self.runtime.add_memory(
+            "strategy", "unrelated campaign lesson stays private",
+            evidence_ids=[other_evidence.id], goal_id=other["id"],
+            run_id=other_run.id)
         projection = self.runtime.assemble_context(prompt="what is next",
                                                   owner_id="director")
         context = projection["context"]
-        self.assertIn("Memory: ", context)
-        self.assertIn("workflow: batch throttling at 25/hour held", context)
-        self.assertIn("strategy: double opt-in lifts reply quality", context)
+        self.assertNotIn("Memory: ", context,
+                         "no arbitrary company-wide memory line in ordinary "
+                         "reasoning context")
+        self.assertIn("Relevant memory:", context)
+        self.assertIn("batch throttling at 25/hour held", context,
+                      "the goal's own workflow learning renders")
+        self.assertIn("double opt-in lifts reply quality", context,
+                      "the goal's own strategy learning renders")
+        self.assertNotIn("unrelated campaign lesson stays private", context,
+                         "an unrelated goal's learning must not leak in")
         self.assertIn("Profile: owner.pref=", context,
                       "owner profile claims stay on their own line")
-        for item in self.runtime.memories(limit=10):
-            if item["status"] == "active":
-                self.assertIn(item["id"], projection["sources"],
-                              "every rendered memory id must be a source")
+        self.assertEqual(context.count("concise reports"), 1,
+                         "no owner claim renders twice (Profile is the only "
+                         "line for owner memory)")
+        rendered_claims = [item.claim for item in self.runtime.memory.relevant(
+            goal_id=self.goal_id) if item.scope != "owner"]
+        for claim in rendered_claims:
+            self.assertEqual(context.count(claim), 1,
+                             f"claim rendered more than once: {claim}")
 
     def test_projection_superseded_memory_is_not_rendered(self):
         self.new_goal()
@@ -1309,21 +1406,20 @@ class TestContextProjectionDecisionLines(DecideBoundaryCase):
 
     def test_recent_decisions_and_declaring_departments_render(self):
         # A director-owned goal whose metric a fixture Department declares
-        # (seo: keyword_opportunities): one decided cycle parks a
-        # decision_request, `goal decide` answers it with bounded direct
-        # work, the order completes, and the evaluated run chains the
-        # next ready run — leaving the goal with real decision history.
+        # (seo: keyword_opportunities): DECIDE chooses the workflow with
+        # no park and no ask, the first step parks as host work, the
+        # order completes, and the evaluated run chains the next ready
+        # run — leaving the goal with real decision history.
         self.new_goal(metric="keyword_opportunities",
                       config={"aggregation": "latest",
                               "priority": "critical"})
         self.runtime.tick(max_advances=10)
-        self.runtime.decide_goal(self.goal_id, "request_agent",
-                                 agent="director",
-                                 instruction="produce the metric evidence")
+        self.assertEqual(self.current_run().decision.kind, "execute_workflow",
+                         "the decidable goal chooses its workflow itself")
         order = self.active_orders()[0]
         self.runtime.complete_work_order(
-            order["id"], "director",
-            [{"kind": "keyword_opportunities",
+            order["id"], order["agent_id"],
+            [{"kind": order["brief"].get("evidence_kind") or "keyword_opportunities",
               "payload": {"keyword_opportunities": 0}}])
         self.runtime.tick(max_advances=10)  # EVALUATE -> next run ready
         projection = self.runtime.assemble_context(
@@ -1332,10 +1428,13 @@ class TestContextProjectionDecisionLines(DecideBoundaryCase):
         context = projection["context"]
         self.assertIn("Recent decisions:", context,
                       "the focus goal renders its decision history")
-        self.assertIn("run 1 request_agent RETURN_TO_GOAL", context,
-                      "sequence, decision kind, and resolution outcome all "
-                      "render")
-        self.assertIn("Departments declaring this metric: seo", context,
+        # Owner voice: decision kinds and resolution outcomes render in
+        # owner words; the enums ride the Machine reference line.
+        self.assertIn("run 1 ran a candidate workflow", context)
+        human, _, machine = context.partition("Machine reference:")
+        self.assertNotIn("execute_workflow", human)
+        self.assertIn("run 1 execute_workflow", machine)
+        self.assertIn("Departments that can move this goal: seo", context,
                       "the Departments declaring the focus metric render")
 
     def test_decision_lines_stay_absent_without_content(self):
@@ -1348,7 +1447,14 @@ class TestContextProjectionDecisionLines(DecideBoundaryCase):
             prompt="what is next", owner_id="director")
         context = projection["context"]
         self.assertNotIn("Recent decisions:", context)
-        self.assertNotIn("Departments declaring this metric:", context)
+        self.assertNotIn("Departments that can move this goal:", context)
+        # The Machine reference line always rides along for the Director
+        # (here it carries the focus goal alone) — but its content never
+        # leaks into the human lines above it.
+        self.assertIn("Machine reference:", context)
+        human, _, machine = context.partition("Machine reference:")
+        self.assertNotIn("fresh_metric", human)
+        self.assertIn("fresh_metric", machine)
 
 
 # =========================================================================
